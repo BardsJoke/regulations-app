@@ -2,3 +2,6 @@
 .env
 __pycache__/
 *.py[cod]
+# Бдешки
+*.sqlite3
+*.sqlite3-*

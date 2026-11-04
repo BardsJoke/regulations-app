@@ -1,12 +1,6 @@
-# Автоматическое определение текстовых файлов
-* text=auto
+# Все файлы в lf
+* text=auto eol=lf
 
-# Единый формат переносов строк для исходников
-*.py text eol=lf
-*.toml text eol=lf
-*.md text eol=lf
-*.sql text eol=lf
-*.json text eol=lf
-*.yaml text eol=lf
-*.yml text eol=lf
-*.gitignore text eol=lf
+# Для windows
+*.bat text eol=crlf
+*.cmd text eol=crlf
