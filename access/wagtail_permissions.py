@@ -4,17 +4,27 @@ from wagtail.permission_policies import BasePermissionPolicy
 from .models import ModuleRole
 
 
-class RoleAssignmentPermissionPolicy(BasePermissionPolicy):
+class ModuleAdminPermissionPolicy(BasePermissionPolicy):
     """
-    Разрешает управлять назначениями ролей
-    только активным пользователям с ролью администратора модуля.
+    Общая политика доступа к функциям модуля regulations.
+
+    Управлять объектами могут только активные пользователи,
+    которым назначена роль администратора модуля.
     """
 
-    allowed_actions = frozenset({
+    default_allowed_actions = frozenset({
+        "view",
         "add",
         "change",
-        "view",
     })
+
+    def __init__(self, model, allowed_actions=None):
+        super().__init__(model)
+
+        if allowed_actions is None:
+            allowed_actions = self.default_allowed_actions
+
+        self.allowed_actions = frozenset(allowed_actions)
 
     def users_with_any_permission(self, actions):
         if not self.allowed_actions.intersection(actions):
@@ -24,3 +34,14 @@ class RoleAssignmentPermissionPolicy(BasePermissionPolicy):
             is_active=True,
             regulations_role__role=ModuleRole.ADMINISTRATOR,
         )
+
+
+class RoleAssignmentPermissionPolicy(ModuleAdminPermissionPolicy):
+    """
+    Политика управления назначениями ролей.
+
+    Оставлена отдельным именем для совместимости
+    с уже созданным интерфейсом приложения access.
+    """
+
+    pass

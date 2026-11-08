@@ -29,6 +29,7 @@ INSTALLED_APPS = [
     "accounts",
     "access",
     "catalogs.apps.CatalogsConfig",
+    "changes.apps.ChangesConfig",
     "wagtail.contrib.forms",
     "wagtail.contrib.redirects",
     "wagtail.embeds",
