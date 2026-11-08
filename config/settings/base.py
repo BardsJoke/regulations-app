@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     "search",
     "accounts",
     "access",
+    "catalogs.apps.CatalogsConfig",
     "wagtail.contrib.forms",
     "wagtail.contrib.redirects",
     "wagtail.embeds",
