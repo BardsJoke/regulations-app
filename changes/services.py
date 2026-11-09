@@ -410,3 +410,60 @@ def cancel_ticket(*, ticket_id, actor, comment=""):
     )
 
     return ticket
+@transaction.atomic
+def update_draft(
+    *,
+    ticket_id,
+    actor,
+    software,
+    source_version="",
+    target_version="",
+    risks="",
+    window_start_at=None,
+    window_end_at=None,
+):
+    """
+    Обновляет существующий черновик.
+
+    Исполнитель может редактировать только собственные
+    карточки, пока они находятся в статусе draft.
+    """
+
+    _require_role(actor, ModuleRole.EXECUTOR)
+
+    ticket = _get_locked_ticket(ticket_id)
+
+    _require_ticket_creator(actor, ticket)
+
+    if ticket.status.code != CardStatusCode.DRAFT:
+        raise ChangeWorkflowError(
+            "Редактировать можно только карточку в статусе «Черновик»."
+        )
+
+    if not software.is_active and software.pk != ticket.software_id:
+        raise ChangeWorkflowError(
+            "Нельзя выбрать неактивное программное обеспечение."
+        )
+
+    ticket.software = software
+    ticket.source_version = source_version
+    ticket.target_version = target_version
+    ticket.risks = risks
+    ticket.window_start_at = window_start_at
+    ticket.window_end_at = window_end_at
+
+    ticket.full_clean()
+
+    ticket.save(
+        update_fields=[
+            "software",
+            "source_version",
+            "target_version",
+            "risks",
+            "window_start_at",
+            "window_end_at",
+            "updated_at",
+        ]
+    )
+
+    return ticket

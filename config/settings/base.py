@@ -27,7 +27,7 @@ INSTALLED_APPS = [
     "home",
     "search",
     "accounts",
-    "access",
+    "access.apps.AccessConfig",
     "catalogs.apps.CatalogsConfig",
     "changes.apps.ChangesConfig",
     "wagtail.contrib.forms",
