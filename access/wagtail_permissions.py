@@ -32,7 +32,7 @@ class ModuleAdminPermissionPolicy(BasePermissionPolicy):
 
         return get_user_model().objects.filter(
             is_active=True,
-            regulations_role__role=ModuleRole.ADMINISTRATOR,
+            regulations_role_assignments__role=ModuleRole.ADMINISTRATOR
         )
 
 

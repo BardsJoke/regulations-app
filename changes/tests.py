@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+from .permissions import ChangeTicketPermissionPolicy
+
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
 from django.test import TestCase
@@ -417,4 +419,128 @@ class ChangeWorkflowTests(TestCase):
                 ApprovalDecision.REJECTED,
                 ApprovalDecision.APPROVED,
             ],
+        )
+class ChangeTicketMultiRolePermissionTests(TestCase):
+
+    def setUp(self):
+        self.executor = User.objects.create_user(
+            username="multi_role_executor",
+            email="multi_role_executor@example.test",
+            password="test-password",
+        )
+
+        self.other_user = User.objects.create_user(
+            username="other_executor",
+            email="other_executor@example.test",
+            password="test-password",
+        )
+
+        # Один пользователь имеет две роли.
+        RoleAssignment.objects.create(
+            user=self.executor,
+            role=ModuleRole.EXECUTOR,
+        )
+
+        RoleAssignment.objects.create(
+            user=self.executor,
+            role=ModuleRole.APPROVER,
+        )
+
+        software_type = SoftwareType.objects.create(
+            name="Категория нескольких ролей",
+        )
+
+        self.software = MuseumSoftware.objects.create(
+            software_type=software_type,
+            name="Тестовое музейное ПО",
+            current_version="1.0",
+        )
+
+        # Собственная карточка исполнителя.
+        self.own_ticket = ChangeTicket.objects.create(
+            software=self.software,
+            created_by=self.executor,
+            status=CardStatus.objects.get(
+                code=CardStatusCode.DRAFT,
+            ),
+            source_version="1.0",
+            target_version="2.0",
+        )
+
+        # Чужая карточка на согласовании.
+        self.other_ticket = ChangeTicket.objects.create(
+            software=self.software,
+            created_by=self.other_user,
+            status=CardStatus.objects.get(
+                code=CardStatusCode.PENDING,
+            ),
+            source_version="1.0",
+            target_version="2.0",
+        )
+
+        self.policy = ChangeTicketPermissionPolicy(ChangeTicket)
+
+    def test_user_receives_permissions_from_both_roles(self):
+
+        # Глобальные права объединяются.
+        self.assertTrue(
+            self.policy.user_has_permission(
+                self.executor,
+                "view",
+            )
+        )
+
+        self.assertTrue(
+            self.policy.user_has_permission(
+                self.executor,
+                "change",
+            )
+        )
+
+        # Исполнитель может редактировать собственный черновик.
+        self.assertTrue(
+            self.policy.user_has_permission_for_instance(
+                self.executor,
+                "change",
+                self.own_ticket,
+            )
+        )
+
+        # Руководитель может просматривать чужую карточку
+        # на согласовании.
+        self.assertTrue(
+            self.policy.user_has_permission_for_instance(
+                self.executor,
+                "view",
+                self.other_ticket,
+            )
+        )
+
+        # Но не может редактировать чужую карточку.
+        self.assertFalse(
+            self.policy.user_has_permission_for_instance(
+                self.executor,
+                "change",
+                self.other_ticket,
+            )
+        )
+
+        # Проверяем объединение карточек в queryset.
+        visible_tickets = (
+            self.policy.instances_user_has_any_permission_for(
+                self.executor,
+                {"view"},
+            )
+        )
+
+        visible_ids = set(
+            visible_tickets.values_list("pk", flat=True)
+        )
+
+        self.assertSetEqual(
+            visible_ids,
+            {
+                self.own_ticket.pk,
+                self.other_ticket.pk,
+            },
         )

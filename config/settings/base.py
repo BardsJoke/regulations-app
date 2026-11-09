@@ -31,6 +31,7 @@ INSTALLED_APPS = [
     "catalogs.apps.CatalogsConfig",
     "changes.apps.ChangesConfig",
     "operations.apps.OperationsConfig",
+    "backups.apps.BackupsConfig",
     "wagtail.contrib.forms",
     "wagtail.contrib.redirects",
     "wagtail.embeds",

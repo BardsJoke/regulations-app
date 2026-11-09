@@ -1,4 +1,6 @@
+
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 
 from wagtail.permission_policies import BasePermissionPolicy
 
@@ -10,29 +12,49 @@ class ChangeTicketPermissionPolicy(BasePermissionPolicy):
     """
     Политика доступа к карточкам изменений.
 
-    Администратор: просмотр.
-    Руководитель: просмотр карточек на согласовании
-                  и согласованных карточек.
-    Исполнитель: просмотр собственных карточек,
-                 создание и редактирование собственных черновиков.
+    Администратор:
+        Просмотр всех карточек.
+
+    Руководитель:
+        Просмотр карточек на согласовании
+        и согласованных карточек.
+
+    Исполнитель:
+        Просмотр собственных карточек,
+        создание и редактирование собственных черновиков.
+
+    Один пользователь может иметь несколько ролей.
+    Права всех назначенных ролей объединяются.
     """
 
-    def _get_role(self, user):
+    def _get_roles(self, user):
+        """
+        Возвращает все роли активного пользователя.
+        """
+
         if (
             not user
             or not getattr(user, "is_authenticated", False)
             or not getattr(user, "is_active", False)
         ):
-            return None
+            return set()
 
-        return (
+        return set(
             RoleAssignment.objects
             .filter(user_id=user.pk)
             .values_list("role", flat=True)
-            .first()
         )
 
+    # ========================================================
+    # ПРАВА ПОЛЬЗОВАТЕЛЕЙ
+    # ========================================================
+
     def users_with_any_permission(self, actions):
+        """
+        Возвращает пользователей, имеющих хотя бы одно
+        из запрошенных глобальных разрешений.
+        """
+
         actions = set(actions)
         roles = set()
 
@@ -51,19 +73,33 @@ class ChangeTicketPermissionPolicy(BasePermissionPolicy):
 
         return get_user_model().objects.filter(
             is_active=True,
-            regulations_role__role__in=roles,
+            regulations_role_assignments__role__in=roles,
         ).distinct()
 
     def user_has_permission(self, user, action):
-        role = self._get_role(user)
+        """
+        Проверяет глобальные права пользователя.
+        """
+
+        roles = self._get_roles(user)
 
         if action == "view":
-            return role in ModuleRole.values
+            return bool(
+                roles.intersection({
+                    ModuleRole.ADMINISTRATOR,
+                    ModuleRole.APPROVER,
+                    ModuleRole.EXECUTOR,
+                })
+            )
 
         if action in {"add", "change"}:
-            return role == ModuleRole.EXECUTOR
+            return ModuleRole.EXECUTOR in roles
 
         return False
+
+    # ========================================================
+    # ПРАВА НА ОТДЕЛЬНУЮ КАРТОЧКУ
+    # ========================================================
 
     def user_has_permission_for_instance(
         self,
@@ -71,24 +107,44 @@ class ChangeTicketPermissionPolicy(BasePermissionPolicy):
         action,
         instance,
     ):
-        role = self._get_role(user)
+        """
+        Проверяет права пользователя на конкретную карточку.
+
+        Если пользователь имеет несколько ролей,
+        учитываются права каждой из них.
+        """
+
+        roles = self._get_roles(user)
 
         if action == "view":
-            if role == ModuleRole.ADMINISTRATOR:
+
+            # Администратор видит все карточки.
+            if ModuleRole.ADMINISTRATOR in roles:
                 return True
 
-            if role == ModuleRole.APPROVER:
-                return instance.status.code in {
+            # Руководитель видит карточки на согласовании
+            # и согласованные карточки.
+            if (
+                ModuleRole.APPROVER in roles
+                and instance.status.code in {
                     CardStatusCode.PENDING,
                     CardStatusCode.APPROVED,
                 }
+            ):
+                return True
 
-            if role == ModuleRole.EXECUTOR:
-                return instance.created_by_id == user.pk
+            # Исполнитель видит собственные карточки.
+            if (
+                ModuleRole.EXECUTOR in roles
+                and instance.created_by_id == user.pk
+            ):
+                return True
+
+            return False
 
         if action == "change":
             return (
-                role == ModuleRole.EXECUTOR
+                ModuleRole.EXECUTOR in roles
                 and instance.created_by_id == user.pk
                 and instance.status.code == CardStatusCode.DRAFT
             )
@@ -101,6 +157,11 @@ class ChangeTicketPermissionPolicy(BasePermissionPolicy):
         actions,
         instance,
     ):
+        """
+        Проверяет наличие хотя бы одного разрешения
+        на конкретную карточку.
+        """
+
         return any(
             self.user_has_permission_for_instance(
                 user,
@@ -110,13 +171,24 @@ class ChangeTicketPermissionPolicy(BasePermissionPolicy):
             for action in actions
         )
 
-    def instances_user_has_any_permission_for(self, user, actions):
+    # ========================================================
+    # ФИЛЬТРАЦИЯ ДОСТУПНЫХ КАРТОЧЕК
+    # ========================================================
+
+    def instances_user_has_any_permission_for(
+        self,
+        user,
+        actions,
+    ):
         """
-        Возвращает только те карточки, которые пользователь
-        имеет право видеть или изменять.
+        Возвращает карточки, к которым у пользователя
+        есть хотя бы одно из запрошенных разрешений.
+
+        Учитываются все назначенные пользователю роли.
         """
 
-        role = self._get_role(user)
+        roles = self._get_roles(user)
+        actions = set(actions)
 
         queryset = self.model.objects.select_related(
             "software",
@@ -124,37 +196,76 @@ class ChangeTicketPermissionPolicy(BasePermissionPolicy):
             "created_by",
         )
 
-        actions = set(actions)
+        conditions = []
+
+        # ----------------------------------------------------
+        # ПРОСМОТР
+        # ----------------------------------------------------
 
         if "view" in actions:
-            if role == ModuleRole.ADMINISTRATOR:
+
+            # Администратор видит все карточки.
+            if ModuleRole.ADMINISTRATOR in roles:
                 return queryset
 
-            if role == ModuleRole.APPROVER:
-                return queryset.filter(
-                    status__code__in=[
-                        CardStatusCode.PENDING,
-                        CardStatusCode.APPROVED,
-                    ],
+            # Руководитель видит карточки на согласовании
+            # и согласованные карточки.
+            if ModuleRole.APPROVER in roles:
+                conditions.append(
+                    Q(
+                        status__code__in=[
+                            CardStatusCode.PENDING,
+                            CardStatusCode.APPROVED,
+                        ]
+                    )
                 )
 
-            if role == ModuleRole.EXECUTOR:
-                return queryset.filter(
-                    created_by_id=user.pk,
+            # Исполнитель видит все собственные карточки.
+            if ModuleRole.EXECUTOR in roles:
+                conditions.append(
+                    Q(created_by_id=user.pk)
                 )
+
+        # ----------------------------------------------------
+        # РЕДАКТИРОВАНИЕ
+        # ----------------------------------------------------
 
         if (
             "change" in actions
-            and role == ModuleRole.EXECUTOR
+            and ModuleRole.EXECUTOR in roles
         ):
-            return queryset.filter(
-                created_by_id=user.pk,
-                status__code=CardStatusCode.DRAFT,
+            conditions.append(
+                Q(
+                    created_by_id=user.pk,
+                    status__code=CardStatusCode.DRAFT,
+                )
             )
 
-        return queryset.none()
+        # ----------------------------------------------------
+        # ОБЪЕДИНЕНИЕ ПРАВ РАЗНЫХ РОЛЕЙ
+        # ----------------------------------------------------
 
-    def instances_user_has_permission_for(self, user, action):
+        if not conditions:
+            return queryset.none()
+
+        combined_condition = conditions[0]
+
+        for condition in conditions[1:]:
+            combined_condition |= condition
+
+        return queryset.filter(
+            combined_condition
+        ).distinct()
+
+    def instances_user_has_permission_for(
+        self,
+        user,
+        action,
+    ):
+        """
+        Возвращает карточки, доступные для конкретного действия.
+        """
+
         return self.instances_user_has_any_permission_for(
             user,
             {action},

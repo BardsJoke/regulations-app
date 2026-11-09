@@ -1,3 +1,4 @@
+
 import uuid
 
 from django.conf import settings
@@ -77,6 +78,15 @@ class Operation(TimeStampedModel):
         blank=True,
         related_name="rollback_operations",
         verbose_name="Исходная операция",
+    )
+
+    backup_used = models.ForeignKey(
+        "backups.Backup",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="used_in_rollbacks",
+        verbose_name="Резервная копия, использованная при откате",
     )
 
     rollback_reason = models.ForeignKey(
@@ -165,12 +175,14 @@ class Operation(TimeStampedModel):
                         operation_type=OperationType.UPDATE,
                         parent_operation__isnull=True,
                         rollback_reason__isnull=True,
+                        backup_used__isnull=True,
                     )
                     |
                     Q(
                         operation_type=OperationType.ROLLBACK,
                         parent_operation__isnull=False,
                         rollback_reason__isnull=False,
+                        backup_used__isnull=False,
                     )
                 ),
                 name="op_type_parent_reason",
@@ -208,7 +220,12 @@ class Operation(TimeStampedModel):
 
         errors = {}
 
+        # ----------------------------------------------------
+        # ОПЕРАЦИЯ ОБНОВЛЕНИЯ
+        # ----------------------------------------------------
+
         if self.operation_type == OperationType.UPDATE:
+
             if self.parent_operation_id:
                 errors["parent_operation"] = (
                     "Операция обновления не должна ссылаться "
@@ -217,10 +234,23 @@ class Operation(TimeStampedModel):
 
             if self.rollback_reason_id:
                 errors["rollback_reason"] = (
-                    "Для операции обновления причина отката не указывается."
+                    "Для операции обновления причина отката "
+                    "не указывается."
                 )
 
+            if self.backup_used_id:
+                errors["backup_used"] = (
+                    "Для операции обновления используемая "
+                    "резервная копия не указывается."
+                )
+
+        # ----------------------------------------------------
+        # ОПЕРАЦИЯ ОТКАТА
+        # ----------------------------------------------------
+
         elif self.operation_type == OperationType.ROLLBACK:
+
+            # Проверяем исходную операцию.
             if not self.parent_operation_id:
                 errors["parent_operation"] = (
                     "Для отката необходимо указать исходную операцию."
@@ -230,7 +260,8 @@ class Operation(TimeStampedModel):
 
                 if parent.operation_type != OperationType.UPDATE:
                     errors["parent_operation"] = (
-                        "Откат должен ссылаться на операцию обновления."
+                        "Откат должен ссылаться "
+                        "на операцию обновления."
                     )
 
                 elif parent.change_ticket_id != self.change_ticket_id:
@@ -239,10 +270,34 @@ class Operation(TimeStampedModel):
                         "к той же карточке изменения."
                     )
 
+            # Проверяем причину отката.
             if not self.rollback_reason_id:
                 errors["rollback_reason"] = (
                     "Необходимо указать причину отката."
                 )
+
+            # Проверяем резервную копию.
+            if not self.backup_used_id:
+                errors["backup_used"] = (
+                    "Для отката необходимо выбрать резервную копию."
+                )
+            else:
+                backup = self.backup_used
+
+                if (
+                    self.parent_operation_id
+                    and backup.operation_id != self.parent_operation_id
+                ):
+                    errors["backup_used"] = (
+                        "Резервная копия должна принадлежать "
+                        "исходной операции обновления."
+                    )
+
+                elif not backup.is_usable:
+                    errors["backup_used"] = (
+                        "Для отката можно использовать только "
+                        "резервную копию с подтверждённой целостностью."
+                    )
 
         if errors:
             raise ValidationError(errors)
@@ -451,10 +506,7 @@ class StepExecution(TimeStampedModel):
                 )
 
             else:
-                if (
-                    self.plan_step.ticket_id
-                    != operation.change_ticket_id
-                ):
+                if self.plan_step.ticket_id != operation.change_ticket_id:
                     errors["plan_step"] = (
                         "Плановый шаг должен относиться "
                         "к той же карточке изменения."
@@ -599,10 +651,11 @@ class StepTemplate(TimeStampedModel):
                 condition=Q(sort_order__gte=1),
                 name="template_sort_positive",
             ),
+
             models.CheckConstraint(
                 condition=Q(step_kind__in=StepKind.values),
                 name="template_valid_kind",
-),
+            ),
         ]
 
     def __str__(self):

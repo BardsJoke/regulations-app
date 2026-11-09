@@ -20,10 +20,10 @@ class RoleAssignment(models.Model):
         editable=False,
     )
 
-    user = models.OneToOneField(
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
-        related_name="regulations_role",
+        related_name="regulations_role_assignments",
         verbose_name="Пользователь",
     )
 
@@ -62,6 +62,10 @@ class RoleAssignment(models.Model):
                 condition=Q(role__in=ModuleRole.values),
                 name="access_valid_module_role",
             ),
+            models.UniqueConstraint(
+                fields=["user", "role"],
+                name="access_unique_user_role",
+),
         ]
 
     def __str__(self):
