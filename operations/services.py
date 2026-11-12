@@ -3,7 +3,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from access.models import ModuleRole, RoleAssignment
-from catalogs.models import CardStatus, CardStatusCode
+from catalogs.models import CardStatus, CardStatusCode,  RollbackReason
 
 from .models import (
     Operation,
@@ -11,6 +11,7 @@ from .models import (
     OperationType,
     StepExecution,
     StepExecutionStatus,
+    StepTemplate,
 )
 
 import hashlib
@@ -121,7 +122,7 @@ def _require_running_operation(operation):
             "Нельзя изменять шаги завершённой или остановленной операции."
         )
 
-
+@transaction.atomic
 def start_step(*, step_execution_id, actor):
     """
     Начинает выполнение доступного шага.
@@ -631,5 +632,305 @@ def start_update_operation(*, ticket_id, actor):
     # Поэтому результат неудачной проверки SHA-256 сохранён.
     if hash_error_message:
         raise OperationServiceError(hash_error_message)
+
+    return operation
+
+def start_rollback_operation(
+    *,
+    parent_operation_id,
+    backup_id,
+    rollback_reason_id,
+    actor,
+):
+    """
+    Запускает операцию отката.
+
+    Проверяет исходную операцию, карточку, причину отката
+    и резервную копию.
+
+    Перед созданием операции повторно проверяет SHA-256
+    и размер резервной копии.
+
+    Результат неудачной проверки резервной копии сохраняется,
+    но операция отката не создаётся.
+
+    Шаги отката формируются из активных StepTemplate
+    с operation_type=ROLLBACK.
+    """
+
+    from backups.models import Backup
+    from backups.services import verify_backup
+
+    _require_executor(actor)
+
+    verification_error_message = None
+    operation = None
+
+    with transaction.atomic():
+
+        # ----------------------------------------------------
+        # 1. БЛОКИРУЕМ ИСХОДНУЮ ОПЕРАЦИЮ
+        # ----------------------------------------------------
+
+        try:
+            parent_operation = (
+                Operation.objects
+                .select_for_update()
+                .get(pk=parent_operation_id)
+            )
+        except Operation.DoesNotExist:
+            raise OperationServiceError(
+                "Исходная операция не найдена."
+            )
+
+        if parent_operation.operation_type != OperationType.UPDATE:
+            raise OperationServiceError(
+                "Откат возможен только относительно операции обновления."
+            )
+
+        if parent_operation.status not in {
+            OperationStatus.FAILED,
+            OperationStatus.COMPLETED,
+        }:
+            raise OperationServiceError(
+                "Откат возможен только после завершения "
+                "или неудачной попытки обновления."
+            )
+
+        # ----------------------------------------------------
+        # 2. БЛОКИРУЕМ КАРТОЧКУ И ПРОВЕРЯЕМ ПРАВА
+        # ----------------------------------------------------
+
+        try:
+            ticket = (
+                ChangeTicket.objects
+                .select_for_update()
+                .select_related("status")
+                .get(pk=parent_operation.change_ticket_id)
+            )
+        except ChangeTicket.DoesNotExist:
+            raise OperationServiceError(
+                "Карточка изменения не найдена."
+            )
+
+        if ticket.created_by_id != actor.pk:
+            raise PermissionDenied(
+                "Запускать откат может только исполнитель, "
+                "создавший карточку изменения."
+            )
+
+        if ticket.status.code not in {
+            CardStatusCode.IN_PROGRESS,
+            CardStatusCode.COMPLETED,
+        }:
+            raise OperationServiceError(
+                "Текущий статус карточки не допускает запуск отката."
+            )
+
+        # ----------------------------------------------------
+        # 3. ПРОВЕРЯЕМ АКТУАЛЬНОСТЬ ИСХОДНОЙ ОПЕРАЦИИ
+        # ----------------------------------------------------
+
+        latest_update = (
+            Operation.objects
+            .filter(
+                change_ticket=ticket,
+                operation_type=OperationType.UPDATE,
+            )
+            .order_by("-sequence_number")
+            .first()
+        )
+
+        if (
+            latest_update is None
+            or latest_update.pk != parent_operation.pk
+        ):
+            raise OperationServiceError(
+                "Откат разрешён только для последней "
+                "операции обновления карточки."
+            )
+
+        if parent_operation.rollback_operations.filter(
+            status=OperationStatus.COMPLETED
+        ).exists():
+            raise OperationServiceError(
+                "Для этой операции обновления откат уже успешно выполнен."
+            )
+
+        if Operation.objects.filter(
+            change_ticket=ticket,
+            status=OperationStatus.RUNNING,
+        ).exists():
+            raise OperationServiceError(
+                "По этой карточке уже выполняется другая операция."
+            )
+
+        # ----------------------------------------------------
+        # 4. ПРОВЕРЯЕМ ПРИЧИНУ ОТКАТА
+        # ----------------------------------------------------
+
+        try:
+            rollback_reason = RollbackReason.objects.get(
+                pk=rollback_reason_id,
+                is_active=True,
+            )
+        except RollbackReason.DoesNotExist:
+            raise OperationServiceError(
+                "Причина отката не найдена или неактивна."
+            )
+
+        # ----------------------------------------------------
+        # 5. ПОЛУЧАЕМ РЕЗЕРВНУЮ КОПИЮ
+        # ----------------------------------------------------
+
+        try:
+            backup = (
+                Backup.objects
+                .select_for_update()
+                .get(pk=backup_id)
+            )
+        except Backup.DoesNotExist:
+            raise OperationServiceError(
+                "Резервная копия не найдена."
+            )
+
+        if backup.operation_id != parent_operation.pk:
+            raise OperationServiceError(
+                "Выбранная резервная копия не относится "
+                "к исходной операции обновления."
+            )
+
+        # ----------------------------------------------------
+        # 6. ПОЛУЧАЕМ ШАБЛОНЫ ШАГОВ ОТКАТА
+        # ----------------------------------------------------
+
+        templates = list(
+            StepTemplate.objects
+            .filter(
+                operation_type=OperationType.ROLLBACK,
+                is_active=True,
+            )
+            .order_by("sort_order", "name")
+        )
+
+        if not templates:
+            raise OperationServiceError(
+                "Не найдены активные шаблоны шагов отката. "
+                "Сначала необходимо настроить StepTemplate."
+            )
+
+        # ----------------------------------------------------
+        # 7. ПОВТОРНАЯ ПРОВЕРКА РЕЗЕРВНОЙ КОПИИ
+        # ----------------------------------------------------
+
+        # verify_backup использует собственную transaction.atomic.
+        # Здесь она выполняется внутри внешней транзакции.
+        # Если копия повреждена, мы не выбрасываем исключение
+        # внутри транзакции, чтобы сохранить ERROR или INVALID.
+
+        verified_backup = verify_backup(
+            backup_id=backup.pk,
+            actor=actor,
+        )
+
+        if not verified_backup.is_usable:
+
+            verification_error_message = (
+                verified_backup.verification_error
+                or "Целостность резервной копии не подтверждена."
+            )
+
+        else:
+
+            # ------------------------------------------------
+            # 8. РАССЧИТЫВАЕМ НОМЕРА ОПЕРАЦИИ И ПОПЫТКИ
+            # ------------------------------------------------
+
+            max_sequence = (
+                Operation.objects
+                .filter(change_ticket=ticket)
+                .aggregate(value=Max("sequence_number"))["value"]
+                or 0
+            )
+
+            max_attempt = (
+                Operation.objects
+                .filter(
+                    change_ticket=ticket,
+                    operation_type=OperationType.ROLLBACK,
+                )
+                .aggregate(value=Max("attempt_number"))["value"]
+                or 0
+            )
+
+            now = timezone.now()
+
+            # ------------------------------------------------
+            # 9. СОЗДАЁМ ОПЕРАЦИЮ ОТКАТА
+            # ------------------------------------------------
+
+            operation = Operation(
+                change_ticket=ticket,
+                operation_type=OperationType.ROLLBACK,
+                sequence_number=max_sequence + 1,
+                attempt_number=max_attempt + 1,
+                parent_operation=parent_operation,
+                backup_used=verified_backup,
+                rollback_reason=rollback_reason,
+                initiated_by=actor,
+                status=OperationStatus.RUNNING,
+                started_at=now,
+            )
+
+            operation.full_clean()
+            operation.save()
+
+            # ------------------------------------------------
+            # 10. СОЗДАЁМ СОБСТВЕННЫЕ ШАГИ ОТКАТА
+            # ------------------------------------------------
+
+            for index, template in enumerate(templates):
+
+                execution = StepExecution(
+                    operation=operation,
+                    plan_step=None,
+                    step_order=index + 1,
+                    step_kind=template.step_kind,
+                    name=template.name,
+                    description=template.description,
+                    planned_duration_min=template.default_duration_min,
+                    status=(
+                        StepExecutionStatus.AVAILABLE
+                        if index == 0
+                        else StepExecutionStatus.LOCKED
+                    ),
+                )
+
+                execution.full_clean()
+                execution.save()
+
+            # ------------------------------------------------
+            # 11. ВОЗВРАЩАЕМ КАРТОЧКУ В РАБОТУ
+            # ------------------------------------------------
+
+            if ticket.status.code == CardStatusCode.COMPLETED:
+
+                ticket.status = CardStatus.objects.get(
+                    code=CardStatusCode.IN_PROGRESS
+                )
+
+                ticket.save(
+                    update_fields=["status", "updated_at"]
+                )
+
+    # --------------------------------------------------------
+    # 12. СООБЩАЕМ ОБ ОШИБКЕ ПОСЛЕ ЗАВЕРШЕНИЯ ТРАНЗАКЦИИ
+    # --------------------------------------------------------
+
+    if verification_error_message:
+        raise OperationServiceError(
+            "Резервная копия не прошла проверку целостности. "
+            + verification_error_message
+        )
 
     return operation

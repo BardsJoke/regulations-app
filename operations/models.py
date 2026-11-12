@@ -605,6 +605,13 @@ class StepTemplate(TimeStampedModel):
         verbose_name="Тип шага",
     )
 
+    operation_type = models.CharField(
+        max_length=10,
+        choices=OperationType.choices,
+        default=OperationType.UPDATE,
+        verbose_name="Тип операции",
+    )
+
     name = models.CharField(
         max_length=200,
         verbose_name="Название",
@@ -638,8 +645,8 @@ class StepTemplate(TimeStampedModel):
 
         constraints = [
             models.UniqueConstraint(
-                fields=["step_kind", "name"],
-                name="template_unique_kind_name",
+                fields=["operation_type", "step_kind", "name"],
+                name="template_unique_operation_kind_name",
             ),
 
             models.CheckConstraint(

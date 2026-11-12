@@ -49,6 +49,8 @@ from changes.models import (
     ResourcesCheckStatus,
 )
 
+from backups.models import Backup, BackupIntegrityStatus
+
 User = get_user_model()
 
 
@@ -125,12 +127,29 @@ class OperationsModelTests(TestCase):
         sequence_number=2,
         attempt_number=1,
     ):
+        """
+        Создаёт тестовую резервную копию с подтверждённой
+        целостностью и связанную с ней операцию отката.
+        """
+
+        backup = Backup.objects.create(
+            operation=parent_operation,
+            file="test-backups/test-backup.bin",
+            file_sha256="a" * 64,
+            size_bytes=1024,
+            created_by=self.user,
+            integrity_status=BackupIntegrityStatus.VALID,
+            verified_at=timezone.now(),
+            verification_error="",
+        )
+
         return Operation.objects.create(
             change_ticket=parent_operation.change_ticket,
             operation_type=OperationType.ROLLBACK,
             sequence_number=sequence_number,
             attempt_number=attempt_number,
             parent_operation=parent_operation,
+            backup_used=backup,
             rollback_reason=self.rollback_reason,
             initiated_by=self.user,
         )
@@ -200,6 +219,7 @@ class OperationsModelTests(TestCase):
             parent_operation=first_rollback,
             rollback_reason=self.rollback_reason,
             initiated_by=self.user,
+            backup_used=first_rollback.backup_used,
         )
 
         with self.assertRaises(ValidationError):
