@@ -1,9 +1,26 @@
+
+import hashlib
+
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 
 from access.models import ModuleRole, RoleAssignment
-from catalogs.models import CardStatus, CardStatusCode,  RollbackReason
+from audit.services import AuditAction, record_event
+from catalogs.models import (
+    CardStatus,
+    CardStatusCode,
+    RollbackReason,
+)
+from changes.models import (
+    ChangeTicket,
+    CompatibilityStatus,
+    HashStatus,
+    ResourcesCheckStatus,
+    PlanStep,
+    StepKind,
+)
 
 from .models import (
     Operation,
@@ -14,22 +31,18 @@ from .models import (
     StepTemplate,
 )
 
-import hashlib
 
-from django.db.models import Max
-
-from changes.models import (
-    ChangeTicket,
-    CompatibilityStatus,
-    HashStatus,
-    ResourcesCheckStatus,
-    PlanStep,
-    StepKind,
-)
-
+# ============================================================
+# ОШИБКИ СЕРВИСА
+# ============================================================
 
 class OperationServiceError(ValidationError):
     """Ошибка при выполнении бизнес-операции."""
+
+
+# ============================================================
+# ВЫЧИСЛЕНИЕ SHA-256 ПАКЕТА
+# ============================================================
 
 def _calculate_package_sha256(package_file):
     """
@@ -49,6 +62,11 @@ def _calculate_package_sha256(package_file):
             digest.update(chunk)
 
     return digest.hexdigest()
+
+
+# ============================================================
+# ПРОВЕРКА ПРАВ ИСПОЛНИТЕЛЯ
+# ============================================================
 
 def _require_executor(actor):
     """
@@ -77,16 +95,23 @@ def _require_executor(actor):
         )
 
 
+# ============================================================
+# БЛОКИРОВКА ОПЕРАЦИИ И ШАГА
+# ============================================================
+
 def _lock_operation_and_step(step_execution_id):
     """
     Блокирует операцию и шаг на время транзакции.
-    Это защищает от параллельного выполнения действий.
+
+    Это защищает от параллельного выполнения действий
+    при использовании СУБД с поддержкой блокировок строк.
     """
 
     try:
         step_reference = StepExecution.objects.only(
             "operation_id"
         ).get(pk=step_execution_id)
+
     except StepExecution.DoesNotExist:
         raise OperationServiceError(
             "Шаг выполнения не найден."
@@ -116,11 +141,20 @@ def _lock_operation_and_step(step_execution_id):
     return operation, step
 
 
+# ============================================================
+# ПРОВЕРКА СТАТУСА ОПЕРАЦИИ
+# ============================================================
+
 def _require_running_operation(operation):
     if operation.status != OperationStatus.RUNNING:
         raise OperationServiceError(
             "Нельзя изменять шаги завершённой или остановленной операции."
         )
+
+
+# ============================================================
+# НАЧАЛО ВЫПОЛНЕНИЯ ШАГА
+# ============================================================
 
 @transaction.atomic
 def start_step(*, step_execution_id, actor):
@@ -129,6 +163,8 @@ def start_step(*, step_execution_id, actor):
 
     Предыдущий шаг должен быть завершён.
     Одновременно может выполняться только один шаг операции.
+
+    Регистрирует событие STEP_STARTED.
     """
 
     _require_executor(actor)
@@ -193,8 +229,24 @@ def start_step(*, step_execution_id, actor):
         ]
     )
 
+    # Регистрируем начало шага в журнале аудита.
+    record_event(
+        actor=actor,
+        action=AuditAction.STEP_STARTED,
+        obj=step,
+        details={
+            "operation_id": str(operation.pk),
+            "step_order": step.step_order,
+            "step_kind": step.step_kind,
+        },
+    )
+
     return step
 
+
+# ============================================================
+# УСПЕШНОЕ ЗАВЕРШЕНИЕ ШАГА
+# ============================================================
 
 @transaction.atomic
 def complete_step(
@@ -209,6 +261,9 @@ def complete_step(
     Если следующий шаг существует, он становится доступным.
     Если все шаги завершены, завершается операция и обновляется
     статус карточки изменения.
+
+    Все события регистрируются в журнале аудита
+    в рамках одной транзакции.
     """
 
     _require_executor(actor)
@@ -243,6 +298,25 @@ def complete_step(
         ]
     )
 
+    # --------------------------------------------------------
+    # 1. РЕГИСТРИРУЕМ ЗАВЕРШЕНИЕ ШАГА
+    # --------------------------------------------------------
+
+    record_event(
+        actor=actor,
+        action=AuditAction.STEP_COMPLETED,
+        obj=step,
+        details={
+            "operation_id": str(operation.pk),
+            "step_order": step.step_order,
+            "step_kind": step.step_kind,
+        },
+    )
+
+    # --------------------------------------------------------
+    # 2. ПРОВЕРЯЕМ СЛЕДУЮЩИЙ ШАГ
+    # --------------------------------------------------------
+
     next_step = (
         StepExecution.objects
         .select_for_update()
@@ -254,6 +328,7 @@ def complete_step(
     )
 
     if next_step:
+
         if next_step.status != StepExecutionStatus.LOCKED:
             raise OperationServiceError(
                 "Обнаружено некорректное состояние следующего шага."
@@ -266,6 +341,7 @@ def complete_step(
         )
 
     else:
+
         unfinished_steps = (
             StepExecution.objects
             .filter(operation=operation)
@@ -277,6 +353,10 @@ def complete_step(
             raise OperationServiceError(
                 "Не все шаги операции завершены."
             )
+
+        # ----------------------------------------------------
+        # 3. ЗАВЕРШАЕМ ОПЕРАЦИЮ
+        # ----------------------------------------------------
 
         operation.status = OperationStatus.COMPLETED
         operation.finished_at = now
@@ -295,7 +375,10 @@ def complete_step(
             ]
         )
 
-        # После успешного завершения операции обновляем карточку.
+        # ----------------------------------------------------
+        # 4. ОБНОВЛЯЕМ СТАТУС КАРТОЧКИ
+        # ----------------------------------------------------
+
         ticket_status_code = (
             CardStatusCode.COMPLETED
             if operation.operation_type == OperationType.UPDATE
@@ -313,8 +396,29 @@ def complete_step(
             update_fields=["status", "updated_at"]
         )
 
+        # ----------------------------------------------------
+        # 5. РЕГИСТРИРУЕМ ЗАВЕРШЕНИЕ ОПЕРАЦИИ
+        # ----------------------------------------------------
+
+        record_event(
+            actor=actor,
+            action=AuditAction.OPERATION_COMPLETED,
+            obj=operation,
+            details={
+                "operation_type": operation.operation_type,
+                "sequence_number": operation.sequence_number,
+                "attempt_number": operation.attempt_number,
+                "ticket_id": str(ticket.pk),
+                "ticket_status": ticket_status_code,
+            },
+        )
+
     return step
 
+
+# ============================================================
+# НЕУДАЧНОЕ ВЫПОЛНЕНИЕ ШАГА
+# ============================================================
 
 @transaction.atomic
 def fail_step(
@@ -329,6 +433,8 @@ def fail_step(
 
     Карточка изменения остаётся в работе, чтобы можно было
     принять решение о повторной попытке или откате.
+
+    События аудита сохраняются в той же транзакции.
     """
 
     _require_executor(actor)
@@ -354,6 +460,10 @@ def fail_step(
 
     now = timezone.now()
 
+    # --------------------------------------------------------
+    # 1. ФИКСИРУЕМ ОШИБКУ ШАГА
+    # --------------------------------------------------------
+
     step.status = StepExecutionStatus.FAILED
     step.finished_by = actor
     step.finished_at = now
@@ -371,6 +481,26 @@ def fail_step(
         ]
     )
 
+    # --------------------------------------------------------
+    # 2. РЕГИСТРИРУЕМ ОШИБКУ ШАГА В AUDIT
+    # --------------------------------------------------------
+
+    record_event(
+        actor=actor,
+        action=AuditAction.STEP_FAILED,
+        obj=step,
+        details={
+            "operation_id": str(operation.pk),
+            "step_order": step.step_order,
+            "step_kind": step.step_kind,
+            "error_recorded": True,
+        },
+    )
+
+    # --------------------------------------------------------
+    # 3. ЗАВЕРШАЕМ ОПЕРАЦИЮ С ОШИБКОЙ
+    # --------------------------------------------------------
+
     operation.status = OperationStatus.FAILED
     operation.finished_at = now
     operation.error_message = error_message
@@ -386,7 +516,28 @@ def fail_step(
         ]
     )
 
+    # --------------------------------------------------------
+    # 4. РЕГИСТРИРУЕМ НЕУДАЧНОЕ ЗАВЕРШЕНИЕ ОПЕРАЦИИ
+    # --------------------------------------------------------
+
+    record_event(
+        actor=actor,
+        action=AuditAction.OPERATION_FAILED,
+        obj=operation,
+        details={
+            "operation_type": operation.operation_type,
+            "sequence_number": operation.sequence_number,
+            "attempt_number": operation.attempt_number,
+            "ticket_id": str(operation.change_ticket_id),
+        },
+    )
+
     return step
+
+
+# ============================================================
+# ЗАПУСК ОПЕРАЦИИ ОБНОВЛЕНИЯ
+# ============================================================
 
 def start_update_operation(*, ticket_id, actor):
     """
@@ -394,6 +545,11 @@ def start_update_operation(*, ticket_id, actor):
 
     Проверяет карточку и пакет, создаёт операцию
     и неизменяемые снимки плановых шагов.
+
+    Проверка SHA-256 выполняется до создания операции.
+    Результат проверки сохраняется даже при несовпадении хеша.
+
+    Успешный запуск регистрируется в журнале аудита.
     """
 
     _require_executor(actor)
@@ -410,12 +566,16 @@ def start_update_operation(*, ticket_id, actor):
                 .select_related("software", "status")
                 .get(pk=ticket_id)
             )
+
         except ChangeTicket.DoesNotExist:
             raise OperationServiceError(
                 "Карточка изменения не найдена."
             )
 
-        # 1. Проверка прав
+        # ----------------------------------------------------
+        # 1. ПРОВЕРКА ПРАВ
+        # ----------------------------------------------------
+
         if ticket.created_by_id != actor.pk:
             raise PermissionDenied(
                 "Запускать обновление может только исполнитель, "
@@ -427,10 +587,14 @@ def start_update_operation(*, ticket_id, actor):
                 "Нельзя обновлять неактивное программное обеспечение."
             )
 
-        # 2. Проверка статуса карточки
+        # ----------------------------------------------------
+        # 2. ПРОВЕРКА СТАТУСА КАРТОЧКИ
+        # ----------------------------------------------------
+
         status_code = ticket.status.code
 
         if status_code == CardStatusCode.IN_PROGRESS:
+
             previous_operation = (
                 Operation.objects
                 .filter(change_ticket=ticket)
@@ -458,7 +622,10 @@ def start_update_operation(*, ticket_id, actor):
                 "У карточки отсутствует согласование руководителя."
             )
 
-        # 3. Проверка планового окна
+        # ----------------------------------------------------
+        # 3. ПРОВЕРКА ПЛАНОВОГО ОКНА
+        # ----------------------------------------------------
+
         now = timezone.now()
 
         if not ticket.window_start_at or not ticket.window_end_at:
@@ -471,18 +638,30 @@ def start_update_operation(*, ticket_id, actor):
                 "Запуск находится за пределами согласованного окна."
             )
 
-        # 4. Проверка предпроверок
-        if ticket.compatibility_status != CompatibilityStatus.COMPATIBLE:
+        # ----------------------------------------------------
+        # 4. ПРОВЕРКА ПРЕДПРОВЕРОК
+        # ----------------------------------------------------
+
+        if (
+            ticket.compatibility_status
+            != CompatibilityStatus.COMPATIBLE
+        ):
             raise OperationServiceError(
                 "Совместимость программного обеспечения не подтверждена."
             )
 
-        if ticket.resources_check_status != ResourcesCheckStatus.SUFFICIENT:
+        if (
+            ticket.resources_check_status
+            != ResourcesCheckStatus.SUFFICIENT
+        ):
             raise OperationServiceError(
                 "Достаточность системных ресурсов не подтверждена."
             )
 
-        # 5. Проверка плановых шагов
+        # ----------------------------------------------------
+        # 5. ПРОВЕРКА ПЛАНОВЫХ ШАГОВ
+        # ----------------------------------------------------
+
         plan_steps = list(
             PlanStep.objects
             .filter(ticket=ticket)
@@ -510,7 +689,10 @@ def start_update_operation(*, ticket_id, actor):
                 "Первым шагом должно быть резервное копирование."
             )
 
-        # 6. Проверка пакета
+        # ----------------------------------------------------
+        # 6. ПРОВЕРКА ПАКЕТА
+        # ----------------------------------------------------
+
         if not ticket.package_file:
             raise OperationServiceError(
                 "В карточке отсутствует пакет обновления."
@@ -525,6 +707,7 @@ def start_update_operation(*, ticket_id, actor):
             actual_sha256 = _calculate_package_sha256(
                 ticket.package_file
             )
+
         except (OSError, ValueError):
             actual_sha256 = ""
             hash_error_message = (
@@ -536,9 +719,13 @@ def start_update_operation(*, ticket_id, actor):
         ticket.hash_checked_at = now
 
         if hash_error_message:
+
             ticket.hash_status = HashStatus.MISMATCH
 
-        elif actual_sha256.lower() != ticket.expected_sha256.lower():
+        elif (
+            actual_sha256.lower()
+            != ticket.expected_sha256.lower()
+        ):
             ticket.hash_status = HashStatus.MISMATCH
             hash_error_message = (
                 "Контрольная сумма SHA-256 не совпадает. "
@@ -546,6 +733,7 @@ def start_update_operation(*, ticket_id, actor):
             )
 
         else:
+
             ticket.hash_status = HashStatus.MATCH
 
         # Сохраняем результат проверки независимо от её исхода.
@@ -558,8 +746,10 @@ def start_update_operation(*, ticket_id, actor):
             ]
         )
 
-        # 7–10. Создание операции выполняется только
-        # при успешной проверке SHA-256.
+        # ----------------------------------------------------
+        # 7. СОЗДАНИЕ ОПЕРАЦИИ ПРИ УСПЕШНОЙ ПРОВЕРКЕ SHA-256
+        # ----------------------------------------------------
+
         if hash_error_message is None:
 
             if Operation.objects.filter(
@@ -573,7 +763,9 @@ def start_update_operation(*, ticket_id, actor):
             max_sequence = (
                 Operation.objects
                 .filter(change_ticket=ticket)
-                .aggregate(value=Max("sequence_number"))["value"] or 0
+                .aggregate(
+                    value=Max("sequence_number")
+                )["value"] or 0
             )
 
             max_attempt = (
@@ -582,7 +774,9 @@ def start_update_operation(*, ticket_id, actor):
                     change_ticket=ticket,
                     operation_type=OperationType.UPDATE,
                 )
-                .aggregate(value=Max("attempt_number"))["value"] or 0
+                .aggregate(
+                    value=Max("attempt_number")
+                )["value"] or 0
             )
 
             operation = Operation(
@@ -597,6 +791,10 @@ def start_update_operation(*, ticket_id, actor):
 
             operation.full_clean()
             operation.save()
+
+            # ------------------------------------------------
+            # 8. СОЗДАЁМ СНИМКИ ПЛАНОВЫХ ШАГОВ
+            # ------------------------------------------------
 
             for index, plan_step in enumerate(plan_steps):
 
@@ -618,8 +816,12 @@ def start_update_operation(*, ticket_id, actor):
                 execution.full_clean()
                 execution.save()
 
-            # 11. Переводим согласованную карточку в работу.
+            # ------------------------------------------------
+            # 9. ПЕРЕВОДИМ КАРТОЧКУ В РАБОТУ
+            # ------------------------------------------------
+
             if status_code == CardStatusCode.APPROVED:
+
                 ticket.status = CardStatus.objects.get(
                     code=CardStatusCode.IN_PROGRESS
                 )
@@ -628,12 +830,38 @@ def start_update_operation(*, ticket_id, actor):
                     update_fields=["status", "updated_at"]
                 )
 
-    # Исключение выбрасывается уже после завершения транзакции.
-    # Поэтому результат неудачной проверки SHA-256 сохранён.
+            # ------------------------------------------------
+            # 10. РЕГИСТРИРУЕМ ЗАПУСК UPDATE В AUDIT
+            # ------------------------------------------------
+
+            # Важно: этот блок находится вне проверки APPROVED.
+            # Поэтому повторные попытки тоже попадут в аудит.
+
+            record_event(
+                actor=actor,
+                action=AuditAction.UPDATE_STARTED,
+                obj=operation,
+                details={
+                    "ticket_id": str(ticket.pk),
+                    "sequence_number": operation.sequence_number,
+                    "attempt_number": operation.attempt_number,
+                    "target_version": ticket.target_version,
+                },
+            )
+
+    # --------------------------------------------------------
+    # 11. ВОЗВРАЩАЕМ ОШИБКУ ПОСЛЕ СОХРАНЕНИЯ РЕЗУЛЬТАТА ПРОВЕРКИ
+    # --------------------------------------------------------
+
     if hash_error_message:
         raise OperationServiceError(hash_error_message)
 
     return operation
+
+
+# ============================================================
+# ЗАПУСК ОПЕРАЦИИ ОТКАТА
+# ============================================================
 
 def start_rollback_operation(
     *,
@@ -678,6 +906,7 @@ def start_rollback_operation(
                 .select_for_update()
                 .get(pk=parent_operation_id)
             )
+
         except Operation.DoesNotExist:
             raise OperationServiceError(
                 "Исходная операция не найдена."
@@ -708,6 +937,7 @@ def start_rollback_operation(
                 .select_related("status")
                 .get(pk=parent_operation.change_ticket_id)
             )
+
         except ChangeTicket.DoesNotExist:
             raise OperationServiceError(
                 "Карточка изменения не найдена."
@@ -774,6 +1004,7 @@ def start_rollback_operation(
                 pk=rollback_reason_id,
                 is_active=True,
             )
+
         except RollbackReason.DoesNotExist:
             raise OperationServiceError(
                 "Причина отката не найдена или неактивна."
@@ -789,6 +1020,7 @@ def start_rollback_operation(
                 .select_for_update()
                 .get(pk=backup_id)
             )
+
         except Backup.DoesNotExist:
             raise OperationServiceError(
                 "Резервная копия не найдена."
@@ -823,11 +1055,6 @@ def start_rollback_operation(
         # 7. ПОВТОРНАЯ ПРОВЕРКА РЕЗЕРВНОЙ КОПИИ
         # ----------------------------------------------------
 
-        # verify_backup использует собственную transaction.atomic.
-        # Здесь она выполняется внутри внешней транзакции.
-        # Если копия повреждена, мы не выбрасываем исключение
-        # внутри транзакции, чтобы сохранить ERROR или INVALID.
-
         verified_backup = verify_backup(
             backup_id=backup.pk,
             actor=actor,
@@ -849,8 +1076,9 @@ def start_rollback_operation(
             max_sequence = (
                 Operation.objects
                 .filter(change_ticket=ticket)
-                .aggregate(value=Max("sequence_number"))["value"]
-                or 0
+                .aggregate(
+                    value=Max("sequence_number")
+                )["value"] or 0
             )
 
             max_attempt = (
@@ -859,8 +1087,9 @@ def start_rollback_operation(
                     change_ticket=ticket,
                     operation_type=OperationType.ROLLBACK,
                 )
-                .aggregate(value=Max("attempt_number"))["value"]
-                or 0
+                .aggregate(
+                    value=Max("attempt_number")
+                )["value"] or 0
             )
 
             now = timezone.now()
@@ -923,8 +1152,29 @@ def start_rollback_operation(
                     update_fields=["status", "updated_at"]
                 )
 
+            # ------------------------------------------------
+            # 12. РЕГИСТРИРУЕМ ЗАПУСК ROLLBACK В AUDIT
+            # ------------------------------------------------
+
+            # Этот блок выполняется при любом допустимом
+            # статусе карточки: IN_PROGRESS или COMPLETED.
+
+            record_event(
+                actor=actor,
+                action=AuditAction.ROLLBACK_STARTED,
+                obj=operation,
+                details={
+                    "ticket_id": str(ticket.pk),
+                    "parent_operation_id": str(parent_operation.pk),
+                    "backup_id": str(verified_backup.pk),
+                    "rollback_reason_id": str(rollback_reason.pk),
+                    "sequence_number": operation.sequence_number,
+                    "attempt_number": operation.attempt_number,
+                },
+            )
+
     # --------------------------------------------------------
-    # 12. СООБЩАЕМ ОБ ОШИБКЕ ПОСЛЕ ЗАВЕРШЕНИЯ ТРАНЗАКЦИИ
+    # 13. СООБЩАЕМ ОБ ОШИБКЕ ПОСЛЕ ЗАВЕРШЕНИЯ ТРАНЗАКЦИИ
     # --------------------------------------------------------
 
     if verification_error_message:

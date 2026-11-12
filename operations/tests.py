@@ -27,6 +27,9 @@ from django.core.exceptions import PermissionDenied
 
 from access.models import ModuleRole, RoleAssignment
 
+from audit.models import AuditEvent
+from audit.services import AuditAction
+
 from .services import (
     OperationServiceError,
     start_step,
@@ -189,6 +192,18 @@ class OperationsModelTests(TestCase):
             status=OperationStatus.FAILED,
         )
 
+        # Создаём резервную копию именно для другой операции UPDATE.
+        other_backup = Backup.objects.create(
+            operation=other_update,
+            file="test-backups/other-backup.bin",
+            file_sha256="a" * 64,
+            size_bytes=1024,
+            created_by=self.user,
+            integrity_status=BackupIntegrityStatus.VALID,
+            verified_at=timezone.now(),
+            verification_error="",
+        )
+
         rollback = Operation(
             change_ticket=self.ticket,
             operation_type=OperationType.ROLLBACK,
@@ -197,6 +212,7 @@ class OperationsModelTests(TestCase):
             parent_operation=other_update,
             rollback_reason=self.rollback_reason,
             initiated_by=self.user,
+            backup_used=other_backup,
         )
 
         with self.assertRaises(ValidationError):
@@ -463,6 +479,16 @@ class OperationServiceTests(TestCase):
 
         self.assertEqual(step.started_by, self.executor)
         self.assertIsNotNone(step.started_at)
+        event = AuditEvent.objects.get(
+            action=AuditAction.STEP_STARTED,
+            object_id=self.step1.pk,
+        )
+
+        self.assertEqual(event.user, self.executor)
+        self.assertEqual(
+            event.object_type,
+            "operations.stepexecution",
+)
 
     def test_locked_step_cannot_be_started(self):
         with self.assertRaises(OperationServiceError):
@@ -492,6 +518,12 @@ class OperationServiceTests(TestCase):
             step_execution_id=self.step1.pk,
             actor=self.executor,
             result="Резервная копия создана",
+        )
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.STEP_COMPLETED,
+                object_id=self.step1.pk,
+            ).exists()
         )
 
         self.step2.refresh_from_db()
@@ -576,6 +608,19 @@ class OperationServiceTests(TestCase):
             self.operation.status,
             OperationStatus.COMPLETED,
         )
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                action=AuditAction.STEP_COMPLETED,
+            ).count(),
+            2,
+        )
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.OPERATION_COMPLETED,
+                object_id=self.operation.pk,
+            ).exists()
+        )
 
         self.assertIsNotNone(self.operation.finished_at)
 
@@ -612,6 +657,20 @@ class OperationServiceTests(TestCase):
         self.assertEqual(
             self.operation.status,
             OperationStatus.FAILED,
+        )
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.STEP_FAILED,
+                object_id=self.step1.pk,
+            ).exists()
+        )
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.OPERATION_FAILED,
+                object_id=self.operation.pk,
+            ).exists()
         )
 
         self.assertIsNotNone(self.operation.finished_at)
@@ -742,6 +801,14 @@ class StartUpdateOperationTests(TestCase):
         operation = start_update_operation(
             ticket_id=self.ticket.pk,
             actor=self.executor,
+        )
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.UPDATE_STARTED,
+                object_id=operation.pk,
+                user=self.executor,
+            ).exists()
         )
 
         self.ticket.refresh_from_db()
@@ -982,3 +1049,10 @@ class StartUpdateOperationTests(TestCase):
         self.assertEqual(operation.sequence_number, 2)
         self.assertEqual(operation.attempt_number, 2)
         self.assertEqual(operation.status, OperationStatus.RUNNING)
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.UPDATE_STARTED,
+                object_id=operation.pk,
+                user=self.executor,
+            ).exists()
+        )
