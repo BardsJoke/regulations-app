@@ -1,6 +1,5 @@
-from datetime import timedelta
 
-from .permissions import ChangeTicketPermissionPolicy
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
@@ -8,6 +7,8 @@ from django.test import TestCase
 from django.utils import timezone
 
 from access.models import ModuleRole, RoleAssignment
+from audit.models import AuditEvent
+from audit.services import AuditAction
 from catalogs.models import (
     CardStatus,
     CardStatusCode,
@@ -22,6 +23,7 @@ from .models import (
     PlanStep,
     StepKind,
 )
+from .permissions import ChangeTicketPermissionPolicy
 from .services import (
     ChangeWorkflowError,
     approve_ticket,
@@ -30,6 +32,7 @@ from .services import (
     reject_ticket,
     reschedule_ticket,
     submit_for_approval,
+    update_draft,
 )
 
 
@@ -118,6 +121,19 @@ class ChangeWorkflowTests(TestCase):
             actor=self.executor,
         )
 
+    def _assert_audit_event(self, *, ticket, actor, action):
+        """Проверяет наличие события аудита для карточки."""
+
+        event = AuditEvent.objects.get(
+            action=action,
+            object_type="changes.changeticket",
+            object_id=ticket.pk,
+        )
+
+        self.assertEqual(event.user, actor)
+
+        return event
+
     # -----------------------------------------------------
     # СОЗДАНИЕ КАРТОЧКИ
     # -----------------------------------------------------
@@ -135,12 +151,57 @@ class ChangeWorkflowTests(TestCase):
             self.executor,
         )
 
+        self._assert_audit_event(
+            ticket=ticket,
+            actor=self.executor,
+            action=AuditAction.CHANGE_CREATED,
+        )
+
     def test_approver_cannot_create_draft(self):
         with self.assertRaises(PermissionDenied):
             create_draft(
                 actor=self.approver,
                 software=self.software,
             )
+
+    # -----------------------------------------------------
+    # РЕДАКТИРОВАНИЕ ЧЕРНОВИКА
+    # -----------------------------------------------------
+
+    def test_executor_can_update_draft(self):
+        ticket = self.create_test_draft()
+
+        result = update_draft(
+            ticket_id=ticket.pk,
+            actor=self.executor,
+            software=self.software,
+            source_version="1.0",
+            target_version="1.2",
+            risks="Обновлённое описание рисков",
+            window_start_at=self.window_start,
+            window_end_at=self.window_end,
+        )
+
+        self.assertEqual(
+            result.target_version,
+            "1.2",
+        )
+
+        self.assertEqual(
+            result.risks,
+            "Обновлённое описание рисков",
+        )
+
+        event = self._assert_audit_event(
+            ticket=ticket,
+            actor=self.executor,
+            action=AuditAction.CHANGE_UPDATED,
+        )
+
+        self.assertEqual(
+            set(event.details["changed_fields"]),
+            {"target_version", "risks"},
+        )
 
     # -----------------------------------------------------
     # ОТПРАВКА НА СОГЛАСОВАНИЕ
@@ -152,6 +213,12 @@ class ChangeWorkflowTests(TestCase):
         self.assertEqual(
             ticket.status.code,
             CardStatusCode.PENDING,
+        )
+
+        self._assert_audit_event(
+            ticket=ticket,
+            actor=self.executor,
+            action=AuditAction.CHANGE_SUBMITTED,
         )
 
     def test_submission_requires_backup_step(self):
@@ -170,6 +237,15 @@ class ChangeWorkflowTests(TestCase):
         self.assertEqual(
             ticket.status.code,
             CardStatusCode.DRAFT,
+        )
+
+        # Неуспешная отправка не должна создавать событие.
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_SUBMITTED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).exists()
         )
 
     def test_executor_cannot_submit_another_users_ticket(self):
@@ -223,6 +299,12 @@ class ChangeWorkflowTests(TestCase):
             1,
         )
 
+        self._assert_audit_event(
+            ticket=ticket,
+            actor=self.approver,
+            action=AuditAction.CHANGE_APPROVED,
+        )
+
     def test_approver_cannot_approve_own_ticket(self):
         ticket = ChangeTicket.objects.create(
             software=self.software,
@@ -237,6 +319,13 @@ class ChangeWorkflowTests(TestCase):
                 ticket_id=ticket.pk,
                 actor=self.approver,
             )
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_APPROVED,
+                object_id=ticket.pk,
+            ).exists()
+        )
 
     # -----------------------------------------------------
     # ОТКЛОНЕНИЕ
@@ -269,6 +358,12 @@ class ChangeWorkflowTests(TestCase):
             1,
         )
 
+        self._assert_audit_event(
+            ticket=ticket,
+            actor=self.approver,
+            action=AuditAction.CHANGE_REJECTED,
+        )
+
     def test_rejection_requires_comment(self):
         ticket = self.submit_test_draft()
 
@@ -289,6 +384,16 @@ class ChangeWorkflowTests(TestCase):
         self.assertEqual(
             ApprovalRecord.objects.filter(ticket=ticket).count(),
             0,
+        )
+
+        # Неуспешное отклонение не должно попадать
+        # в журнал как завершённое действие.
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_REJECTED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).exists()
         )
 
     # -----------------------------------------------------
@@ -314,16 +419,41 @@ class ChangeWorkflowTests(TestCase):
             CardStatusCode.APPROVED,
         )
 
-        self.assertEqual(result.window_start_at, new_start)
-        self.assertEqual(result.window_end_at, new_end)
+        self.assertEqual(
+            result.window_start_at,
+            new_start,
+        )
+
+        self.assertEqual(
+            result.window_end_at,
+            new_end,
+        )
 
         record = ApprovalRecord.objects.get(
             ticket=ticket,
             decision=ApprovalDecision.RESCHEDULED,
         )
 
-        self.assertEqual(record.old_start_at, self.window_start)
-        self.assertEqual(record.new_start_at, new_start)
+        self.assertEqual(
+            record.old_start_at,
+            self.window_start,
+        )
+
+        self.assertEqual(
+            record.new_start_at,
+            new_start,
+        )
+
+        event = self._assert_audit_event(
+            ticket=ticket,
+            actor=self.approver,
+            action=AuditAction.CHANGE_RESCHEDULED,
+        )
+
+        self.assertEqual(
+            event.details["approval_record_id"],
+            str(record.pk),
+        )
 
     def test_reschedule_approved_ticket_keeps_approved_status(self):
         ticket = self.submit_test_draft()
@@ -356,6 +486,12 @@ class ChangeWorkflowTests(TestCase):
             1,
         )
 
+        self._assert_audit_event(
+            ticket=ticket,
+            actor=self.approver,
+            action=AuditAction.CHANGE_RESCHEDULED,
+        )
+
     # -----------------------------------------------------
     # ОТМЕНА
     # -----------------------------------------------------
@@ -379,6 +515,12 @@ class ChangeWorkflowTests(TestCase):
                 ticket=ticket,
                 decision=ApprovalDecision.CANCELLED,
             ).exists()
+        )
+
+        self._assert_audit_event(
+            ticket=ticket,
+            actor=self.approver,
+            action=AuditAction.CHANGE_CANCELLED,
         )
 
     # -----------------------------------------------------
@@ -420,6 +562,36 @@ class ChangeWorkflowTests(TestCase):
                 ApprovalDecision.APPROVED,
             ],
         )
+
+        # История аудита также сохраняет оба решения.
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_REJECTED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).count(),
+            1,
+        )
+
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_APPROVED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).count(),
+            1,
+        )
+
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_SUBMITTED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).count(),
+            2,
+        )
+
+
 class ChangeTicketMultiRolePermissionTests(TestCase):
 
     def setUp(self):

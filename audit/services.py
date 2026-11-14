@@ -25,6 +25,8 @@ class AuditAction:
     CHANGE_SUBMITTED = "change.submitted"
     CHANGE_APPROVED = "change.approved"
     CHANGE_REJECTED = "change.rejected"
+    CHANGE_RESCHEDULED = "change.rescheduled"
+    CHANGE_CANCELLED = "change.cancelled"
 
     # Операции
     UPDATE_STARTED = "operation.update.started"

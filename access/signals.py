@@ -1,3 +1,4 @@
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
@@ -7,7 +8,7 @@ from django.dispatch import receiver
 from .models import RoleAssignment
 
 
-# Специальная группа для всех пользователей модуля Regulations.
+# Специальная группа для пользователей модуля Regulations.
 WAGTAIL_ACCESS_GROUP_NAME = "Regulations — доступ в Wagtail"
 
 
@@ -21,13 +22,11 @@ def get_wagtail_access_group(using="default"):
         name=WAGTAIL_ACCESS_GROUP_NAME
     )
 
-    # Получаем ContentType модели Admin из приложения Wagtail.
     content_type, _ = ContentType.objects.using(using).get_or_create(
         app_label="wagtailadmin",
         model="admin",
     )
 
-    # Получаем или создаём разрешение на вход в Wagtail.
     permission, _ = Permission.objects.using(using).get_or_create(
         content_type=content_type,
         codename="access_admin",
@@ -39,6 +38,38 @@ def get_wagtail_access_group(using="default"):
     group.permissions.add(permission)
 
     return group
+
+
+def _remove_wagtail_access_if_unused(user_id, using="default"):
+    """
+    Убирает пользователя из группы Wagtail только тогда,
+    когда у него больше не осталось назначенных ролей.
+    """
+
+    has_roles = RoleAssignment.objects.using(using).filter(
+        user_id=user_id,
+    ).exists()
+
+    if has_roles:
+        return
+
+    group = Group.objects.using(using).filter(
+        name=WAGTAIL_ACCESS_GROUP_NAME
+    ).first()
+
+    if not group:
+        return
+
+    User = get_user_model()
+
+    user = (
+        User.objects.using(using)
+        .filter(pk=user_id)
+        .first()
+    )
+
+    if user:
+        group.user_set.remove(user)
 
 
 @receiver(pre_save, sender=RoleAssignment)
@@ -62,63 +93,58 @@ def remember_previous_user(sender, instance, using, **kwargs):
 @receiver(post_save, sender=RoleAssignment)
 def grant_wagtail_access(sender, instance, using, **kwargs):
     """
-    При создании или изменении назначения роли:
-    1. Добавляет пользователя в группу Wagtail.
+    При создании или изменении назначения:
+
+    1. Удаляет прежнего пользователя из группы,
+       только если у него больше нет других ролей.
     2. Обеспечивает is_staff=True.
+    3. Добавляет текущего пользователя в группу Wagtail.
     """
 
     group = get_wagtail_access_group(using)
 
-    # Если в назначении заменили пользователя,
-    # убираем прежнего из специальной группы.
-    previous_user_id = getattr(instance, "_previous_user_id", None)
+    previous_user_id = getattr(
+        instance,
+        "_previous_user_id",
+        None,
+    )
 
-    if previous_user_id and previous_user_id != instance.user_id:
-        old_user = (
-            get_user_model().objects.using(using)
-            .filter(pk=previous_user_id)
-            .first()
+    if (
+        previous_user_id
+        and previous_user_id != instance.user_id
+    ):
+        _remove_wagtail_access_if_unused(
+            previous_user_id,
+            using=using,
         )
-
-        if old_user:
-            group.user_set.remove(old_user)
 
     User = get_user_model()
 
-    user = User.objects.using(using).get(pk=instance.user_id)
+    user = User.objects.using(using).get(
+        pk=instance.user_id
+    )
 
-    # Пользователь должен иметь статус сотрудника Django.
     if not user.is_staff:
-        User.objects.using(using).filter(pk=user.pk).update(
-            is_staff=True
-        )
+        User.objects.using(using).filter(
+            pk=user.pk,
+        ).update(is_staff=True)
 
-    # Выдаём доступ в Wagtail через группу.
     group.user_set.add(user)
 
 
 @receiver(post_delete, sender=RoleAssignment)
 def remove_wagtail_access(sender, instance, using, **kwargs):
     """
-    Убирает пользователя из специальной группы,
-    если его назначение роли удалено.
+    После удаления назначения проверяет, остались ли
+    у пользователя другие роли.
+
+    Если не осталось, удаляет его из группы Wagtail.
     """
 
-    group = Group.objects.using(using).filter(
-        name=WAGTAIL_ACCESS_GROUP_NAME
-    ).first()
-
-    if not group:
-        return
-
-    user = (
-        get_user_model().objects.using(using)
-        .filter(pk=instance.user_id)
-        .first()
+    _remove_wagtail_access_if_unused(
+        instance.user_id,
+        using=using,
     )
-
-    if user:
-        group.user_set.remove(user)
 
 
 def sync_wagtail_access_group(sender, using, **kwargs):
@@ -134,15 +160,16 @@ def sync_wagtail_access_group(sender, using, **kwargs):
     user_ids = list(
         RoleAssignment.objects.using(using)
         .values_list("user_id", flat=True)
+        .distinct()
     )
 
-    # Все пользователи с назначенной ролью должны быть is_staff.
     User.objects.using(using).filter(
         pk__in=user_ids,
         is_staff=False,
     ).update(is_staff=True)
 
-    # Группа должна содержать ровно пользователей с назначенными ролями.
-    users = User.objects.using(using).filter(pk__in=user_ids)
+    users = User.objects.using(using).filter(
+        pk__in=user_ids
+    )
 
     group.user_set.set(users)

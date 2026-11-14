@@ -1,3 +1,4 @@
+
 import hashlib
 import tempfile
 
@@ -8,6 +9,8 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from access.models import ModuleRole, RoleAssignment
+from audit.models import AuditEvent
+from audit.services import AuditAction
 
 from catalogs.models import (
     CardStatus,
@@ -147,6 +150,19 @@ class BackupServiceTests(TestCase):
             file=self.create_test_upload(),
         )
 
+    def _assert_audit_event(self, *, backup, actor, action):
+        """Проверяет наличие события аудита для резервной копии."""
+
+        event = AuditEvent.objects.get(
+            action=action,
+            object_type="backups.backup",
+            object_id=backup.pk,
+        )
+
+        self.assertEqual(event.user, actor)
+
+        return event
+
     # ========================================================
     # СОЗДАНИЕ РЕЗЕРВНОЙ КОПИИ
     # ========================================================
@@ -183,6 +199,28 @@ class BackupServiceTests(TestCase):
             backup.file.storage.exists(backup.file.name)
         )
 
+        # Проверяем событие создания в аудите.
+        event = self._assert_audit_event(
+            backup=backup,
+            actor=self.executor,
+            action=AuditAction.BACKUP_CREATED,
+        )
+
+        self.assertEqual(
+            event.details["operation_id"],
+            str(self.operation.pk),
+        )
+
+        self.assertEqual(
+            event.details["file_sha256"],
+            expected_hash,
+        )
+
+        self.assertEqual(
+            event.details["size_bytes"],
+            len(self.file_content),
+        )
+
     def test_empty_backup_cannot_be_created(self):
 
         empty_file = SimpleUploadedFile(
@@ -199,6 +237,13 @@ class BackupServiceTests(TestCase):
             )
 
         self.assertEqual(Backup.objects.count(), 0)
+
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                action=AuditAction.BACKUP_CREATED,
+            ).count(),
+            0,
+        )
 
     def test_backup_cannot_be_created_outside_backup_step(self):
 
@@ -220,6 +265,12 @@ class BackupServiceTests(TestCase):
 
         self.assertEqual(Backup.objects.count(), 0)
 
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.BACKUP_CREATED,
+            ).exists()
+        )
+
     # ========================================================
     # ПРАВА ДОСТУПА
     # ========================================================
@@ -234,6 +285,12 @@ class BackupServiceTests(TestCase):
             )
 
         self.assertEqual(Backup.objects.count(), 0)
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.BACKUP_CREATED,
+            ).exists()
+        )
 
     def test_approver_cannot_verify_backup(self):
 
@@ -250,6 +307,18 @@ class BackupServiceTests(TestCase):
         self.assertEqual(
             backup.integrity_status,
             BackupIntegrityStatus.NOT_CHECKED,
+        )
+
+        # Попытка без нужных прав не должна регистрироваться
+        # как успешная или неуспешная проверка.
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action__in=[
+                    AuditAction.BACKUP_VERIFIED,
+                    AuditAction.BACKUP_VERIFICATION_FAILED,
+                ],
+                object_id=backup.pk,
+            ).exists()
         )
 
     # ========================================================
@@ -281,6 +350,35 @@ class BackupServiceTests(TestCase):
 
         self.assertTrue(
             verified_backup.is_usable
+        )
+
+        # Успешная проверка фиксируется в аудите.
+        event = self._assert_audit_event(
+            backup=backup,
+            actor=self.executor,
+            action=AuditAction.BACKUP_VERIFIED,
+        )
+
+        self.assertEqual(
+            event.details["integrity_status"],
+            BackupIntegrityStatus.VALID,
+        )
+
+        self.assertEqual(
+            event.details["actual_sha256"],
+            backup.file_sha256,
+        )
+
+        self.assertEqual(
+            event.details["actual_size_bytes"],
+            backup.size_bytes,
+        )
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.BACKUP_VERIFICATION_FAILED,
+                object_id=backup.pk,
+            ).exists()
         )
 
     def test_corrupted_backup_receives_invalid_status(self):
@@ -321,6 +419,30 @@ class BackupServiceTests(TestCase):
             verified_backup.is_usable
         )
 
+        # Нарушение целостности фиксируется как неуспешная проверка.
+        event = self._assert_audit_event(
+            backup=backup,
+            actor=self.executor,
+            action=AuditAction.BACKUP_VERIFICATION_FAILED,
+        )
+
+        self.assertEqual(
+            event.details["integrity_status"],
+            BackupIntegrityStatus.INVALID,
+        )
+
+        self.assertNotEqual(
+            event.details["expected_sha256"],
+            event.details["actual_sha256"],
+        )
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.BACKUP_VERIFIED,
+                object_id=backup.pk,
+            ).exists()
+        )
+
     def test_missing_backup_file_receives_error_status(self):
 
         backup = self.create_test_backup()
@@ -350,6 +472,22 @@ class BackupServiceTests(TestCase):
 
         self.assertFalse(
             verified_backup.is_usable
+        )
+
+        # Ошибка чтения также фиксируется в аудите.
+        event = self._assert_audit_event(
+            backup=backup,
+            actor=self.executor,
+            action=AuditAction.BACKUP_VERIFICATION_FAILED,
+        )
+
+        self.assertEqual(
+            event.details["integrity_status"],
+            BackupIntegrityStatus.ERROR,
+        )
+
+        self.assertIsNone(
+            event.details["actual_sha256"],
         )
 
     # ========================================================

@@ -1,10 +1,13 @@
+
 import hashlib
+import logging
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from django.utils import timezone
 
 from access.models import ModuleRole, RoleAssignment
+from audit.services import AuditAction, record_event
 from operations.models import (
     Operation,
     OperationStatus,
@@ -16,8 +19,12 @@ from operations.models import (
 from .models import Backup, BackupIntegrityStatus
 
 
+logger = logging.getLogger(__name__)
+
+
 class BackupServiceError(ValidationError):
     """Ошибка при создании или проверке резервной копии."""
+    pass
 
 
 # ============================================================
@@ -85,6 +92,25 @@ def _calculate_file_metadata(file_obj):
         pass
 
     return digest.hexdigest(), total_size
+
+
+def _cleanup_backup_file(backup):
+    """
+    Пытается удалить файл, если создание записи не завершилось.
+
+    Ошибка очистки не должна скрывать исходное исключение.
+    """
+
+    if not backup.file or not backup.file.name:
+        return
+
+    try:
+        backup.file.storage.delete(backup.file.name)
+    except Exception:
+        logger.exception(
+            "Не удалось удалить файл резервной копии "
+            "после сбоя создания записи."
+        )
 
 
 # ============================================================
@@ -185,12 +211,24 @@ def create_backup(*, operation_id, actor, file):
 
     try:
         backup.save()
+
+        # 5. Регистрируем успешное создание в аудите.
+        record_event(
+            actor=actor,
+            action=AuditAction.BACKUP_CREATED,
+            obj=backup,
+            details={
+                "operation_id": str(operation.pk),
+                "file_sha256": backup.file_sha256,
+                "size_bytes": backup.size_bytes,
+                "integrity_status": backup.integrity_status,
+            },
+        )
+
     except Exception:
-        # Если хранилище успело записать файл,
-        # но сохранение записи в БД завершилось ошибкой,
-        # удаляем оставшийся файл.
-        if backup.file and backup.file.name:
-            backup.file.storage.delete(backup.file.name)
+        # Если файл успел сохраниться, но запись в БД
+        # или аудит завершились ошибкой, удаляем файл.
+        _cleanup_backup_file(backup)
         raise
 
     return backup
@@ -207,6 +245,8 @@ def verify_backup(*, backup_id, actor):
 
     Результат проверки записывается в Backup:
     VALID, INVALID или ERROR.
+
+    Результат каждой завершённой проверки фиксируется в аудите.
     """
 
     _require_executor(actor)
@@ -224,6 +264,9 @@ def verify_backup(*, backup_id, actor):
 
     verified_at = timezone.now()
 
+    actual_sha256 = None
+    actual_size = None
+
     try:
         with backup.file.open("rb") as stored_file:
             actual_sha256, actual_size = (
@@ -235,7 +278,7 @@ def verify_backup(*, backup_id, actor):
         backup.integrity_status = BackupIntegrityStatus.ERROR
         backup.verified_at = verified_at
         backup.verification_error = (
-            f"Не удалось прочитать резервную копию "
+            "Не удалось прочитать резервную копию "
             f"({type(error).__name__})."
         )
 
@@ -263,6 +306,7 @@ def verify_backup(*, backup_id, actor):
 
         backup.verified_at = verified_at
 
+    # Сначала сохраняем фактический результат проверки.
     backup.full_clean()
 
     backup.save(
@@ -273,6 +317,36 @@ def verify_backup(*, backup_id, actor):
             "updated_at",
         ]
     )
+
+    # Затем фиксируем результат в аудите.
+    if backup.integrity_status == BackupIntegrityStatus.VALID:
+        record_event(
+            actor=actor,
+            action=AuditAction.BACKUP_VERIFIED,
+            obj=backup,
+            details={
+                "integrity_status": backup.integrity_status,
+                "file_sha256": backup.file_sha256,
+                "actual_sha256": actual_sha256,
+                "size_bytes": backup.size_bytes,
+                "actual_size_bytes": actual_size,
+            },
+        )
+
+    else:
+        record_event(
+            actor=actor,
+            action=AuditAction.BACKUP_VERIFICATION_FAILED,
+            obj=backup,
+            details={
+                "integrity_status": backup.integrity_status,
+                "verification_error": backup.verification_error,
+                "expected_sha256": backup.file_sha256,
+                "actual_sha256": actual_sha256,
+                "expected_size_bytes": backup.size_bytes,
+                "actual_size_bytes": actual_size,
+            },
+        )
 
     return backup
 

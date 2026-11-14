@@ -1,7 +1,9 @@
+
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 
 from access.models import ModuleRole, RoleAssignment
+from audit.services import AuditAction, record_event
 from catalogs.models import CardStatus, CardStatusCode
 
 from .models import (
@@ -136,6 +138,18 @@ def create_draft(
     ticket.full_clean()
     ticket.save()
 
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_CREATED,
+        obj=ticket,
+        details={
+            "software_id": str(ticket.software_id),
+            "status": ticket.status.code,
+            "source_version": ticket.source_version,
+            "target_version": ticket.target_version,
+        },
+    )
+
     return ticket
 
 
@@ -192,6 +206,16 @@ def submit_for_approval(*, ticket_id, actor):
         ]
     )
 
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_SUBMITTED,
+        obj=ticket,
+        details={
+            "status_before": CardStatusCode.DRAFT,
+            "status_after": ticket.status.code,
+        },
+    )
+
     return ticket
 
 
@@ -229,11 +253,22 @@ def approve_ticket(*, ticket_id, actor, comment=""):
         ]
     )
 
-    ApprovalRecord.objects.create(
+    approval_record = ApprovalRecord.objects.create(
         ticket=ticket,
         approver=actor,
         decision=ApprovalDecision.APPROVED,
         comment=comment.strip(),
+    )
+
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_APPROVED,
+        obj=ticket,
+        details={
+            "approval_record_id": str(approval_record.pk),
+            "status_before": old_status.code,
+            "status_after": ticket.status.code,
+        },
     )
 
     return ticket
@@ -265,7 +300,7 @@ def reject_ticket(*, ticket_id, actor, comment):
             "При отклонении необходимо указать комментарий."
         )
 
-    ApprovalRecord.objects.create(
+    approval_record = ApprovalRecord.objects.create(
         ticket=ticket,
         approver=actor,
         decision=ApprovalDecision.REJECTED,
@@ -283,6 +318,17 @@ def reject_ticket(*, ticket_id, actor, comment):
             "approved_by",
             "updated_at",
         ]
+    )
+
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_REJECTED,
+        obj=ticket,
+        details={
+            "approval_record_id": str(approval_record.pk),
+            "status_before": CardStatusCode.PENDING,
+            "status_after": ticket.status.code,
+        },
     )
 
     return ticket
@@ -337,7 +383,7 @@ def reschedule_ticket(
 
     ticket.clean()
 
-    approval = ApprovalRecord.objects.create(
+    approval_record = ApprovalRecord.objects.create(
         ticket=ticket,
         approver=actor,
         decision=ApprovalDecision.RESCHEDULED,
@@ -365,6 +411,27 @@ def reschedule_ticket(
 
     ticket.save(update_fields=update_fields)
 
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_RESCHEDULED,
+        obj=ticket,
+        details={
+            "approval_record_id": str(approval_record.pk),
+            "status_before": current_status,
+            "status_after": ticket.status.code,
+            "old_window_start": (
+                old_start_at.isoformat()
+                if old_start_at else None
+            ),
+            "old_window_end": (
+                old_end_at.isoformat()
+                if old_end_at else None
+            ),
+            "new_window_start": new_start_at.isoformat(),
+            "new_window_end": new_end_at.isoformat(),
+        },
+    )
+
     return ticket
 
 
@@ -391,7 +458,9 @@ def cancel_ticket(*, ticket_id, actor, comment=""):
             "или согласованную карточку."
         )
 
-    ApprovalRecord.objects.create(
+    old_status = ticket.status.code
+
+    approval_record = ApprovalRecord.objects.create(
         ticket=ticket,
         approver=actor,
         decision=ApprovalDecision.CANCELLED,
@@ -409,7 +478,24 @@ def cancel_ticket(*, ticket_id, actor, comment=""):
         ]
     )
 
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_CANCELLED,
+        obj=ticket,
+        details={
+            "approval_record_id": str(approval_record.pk),
+            "status_before": old_status,
+            "status_after": ticket.status.code,
+        },
+    )
+
     return ticket
+
+
+# ---------------------------------------------------------
+# РЕДАКТИРОВАНИЕ ЧЕРНОВИКА
+# ---------------------------------------------------------
+
 @transaction.atomic
 def update_draft(
     *,
@@ -440,6 +526,26 @@ def update_draft(
             "Редактировать можно только карточку в статусе «Черновик»."
         )
 
+    changed_fields = []
+
+    if ticket.software_id != software.pk:
+        changed_fields.append("software")
+
+    if ticket.source_version != source_version:
+        changed_fields.append("source_version")
+
+    if ticket.target_version != target_version:
+        changed_fields.append("target_version")
+
+    if ticket.risks != risks:
+        changed_fields.append("risks")
+
+    if ticket.window_start_at != window_start_at:
+        changed_fields.append("window_start_at")
+
+    if ticket.window_end_at != window_end_at:
+        changed_fields.append("window_end_at")
+
     if not software.is_active and software.pk != ticket.software_id:
         raise ChangeWorkflowError(
             "Нельзя выбрать неактивное программное обеспечение."
@@ -464,6 +570,16 @@ def update_draft(
             "window_end_at",
             "updated_at",
         ]
+    )
+
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_UPDATED,
+        obj=ticket,
+        details={
+            "changed_fields": changed_fields,
+            "status": ticket.status.code,
+        },
     )
 
     return ticket
