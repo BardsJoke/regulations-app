@@ -8,19 +8,16 @@ from django.utils import timezone
 
 from access.models import ModuleRole, RoleAssignment
 from audit.services import AuditAction, record_event
-from catalogs.models import (
-    CardStatus,
-    CardStatusCode,
-    RollbackReason,
-)
+from catalogs.models import CardStatus, CardStatusCode, RollbackReason
 from changes.models import (
     ChangeTicket,
     CompatibilityStatus,
     HashStatus,
-    ResourcesCheckStatus,
     PlanStep,
+    ResourcesCheckStatus,
     StepKind,
 )
+from deployments.models import DeploymentTarget
 
 from .models import (
     Operation,
@@ -32,98 +29,141 @@ from .models import (
 )
 
 
-# ============================================================
-# ОШИБКИ СЕРВИСА
-# ============================================================
-
 class OperationServiceError(ValidationError):
-    """Ошибка при выполнении бизнес-операции."""
+    """Ошибка бизнес-правил при выполнении операции."""
 
 
 # ============================================================
-# ВЫЧИСЛЕНИЕ SHA-256 ПАКЕТА
-# ============================================================
-
-def _calculate_package_sha256(package_file):
-    """
-    Вычисляет SHA-256 непосредственно по содержимому файла.
-
-    Файл читается частями, поэтому не нужно загружать
-    весь пакет в оперативную память.
-    """
-
-    digest = hashlib.sha256()
-
-    with package_file.open("rb") as package:
-        for chunk in iter(
-            lambda: package.read(1024 * 1024),
-            b"",
-        ):
-            digest.update(chunk)
-
-    return digest.hexdigest()
-
-
-# ============================================================
-# ПРОВЕРКА ПРАВ ИСПОЛНИТЕЛЯ
+# ПРОВЕРКА ПРАВ И ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 def _require_executor(actor):
     """
-    Проверяет, что пользователь активен
+    Проверяет, что пользователь авторизован, активен
     и имеет роль исполнителя.
     """
 
-    if (
-        not actor
-        or not getattr(actor, "is_authenticated", False)
-        or not getattr(actor, "is_active", False)
-    ):
+    if not actor or not actor.is_authenticated or not actor.is_active:
         raise PermissionDenied(
-            "Для выполнения действия необходима "
-            "активная учётная запись."
+            "Для выполнения операции необходимо войти в систему."
         )
 
-    has_role = RoleAssignment.objects.filter(
-        user_id=actor.pk,
+    # В модели RoleAssignment отсутствует поле is_active.
+    has_executor_role = RoleAssignment.objects.filter(
+        user=actor,
         role=ModuleRole.EXECUTOR,
     ).exists()
 
-    if not has_role:
+    if not has_executor_role:
         raise PermissionDenied(
-            "Только исполнитель может выполнять технические шаги."
+            "Недостаточно прав: требуется роль исполнителя."
         )
 
 
-# ============================================================
-# БЛОКИРОВКА ОПЕРАЦИИ И ШАГА
-# ============================================================
+def _calculate_package_sha256(package_file):
+    """
+    Вычисляет SHA-256 загруженного пакета обновления.
+    """
+
+    if not package_file:
+        raise OperationServiceError(
+            "Не загружен пакет обновления."
+        )
+
+    digest = hashlib.sha256()
+
+    package_file.open("rb")
+
+    try:
+        for chunk in package_file.chunks():
+            digest.update(chunk)
+    finally:
+        package_file.close()
+
+    return digest.hexdigest()
+
+
+def _lock_and_validate_deployment_target(ticket):
+    """
+    Блокирует целевую установку и проверяет возможность
+    выполнения операции на ней.
+
+    is_configured проверяет настройки в базе данных.
+    Реальное соединение с установкой будет проверяться
+    отдельным адаптером развертывания.
+    """
+
+    if not ticket.deployment_target_id:
+        raise OperationServiceError(
+            "Для карточки не указана целевая установка."
+        )
+
+    try:
+        target = (
+            DeploymentTarget.objects
+            .select_for_update()
+            .select_related("software")
+            .get(pk=ticket.deployment_target_id)
+        )
+    except DeploymentTarget.DoesNotExist:
+        raise OperationServiceError(
+            "Целевая установка не найдена."
+        )
+
+    if target.software_id != ticket.software_id:
+        raise OperationServiceError(
+            "Целевая установка относится к другому программному обеспечению."
+        )
+
+    if not target.is_configured:
+        raise OperationServiceError(
+            "Целевая установка не настроена."
+        )
+
+    if not target.is_active:
+        raise OperationServiceError(
+            "Целевая установка неактивна."
+        )
+
+    if not target.software.is_active:
+        raise OperationServiceError(
+            "Программное обеспечение целевой установки неактивно."
+        )
+
+    return target
+
 
 def _lock_operation_and_step(step_execution_id):
     """
-    Блокирует операцию и шаг на время транзакции.
+    Блокирует операцию и соответствующий шаг.
 
-    Это защищает от параллельного выполнения действий
-    при использовании СУБД с поддержкой блокировок строк.
+    Идентификатор операции определяется через StepExecution.
     """
 
     try:
-        step_reference = StepExecution.objects.only(
-            "operation_id"
-        ).get(pk=step_execution_id)
-
+        step_reference = (
+            StepExecution.objects
+            .only("operation_id")
+            .get(pk=step_execution_id)
+        )
     except StepExecution.DoesNotExist:
         raise OperationServiceError(
-            "Шаг выполнения не найден."
+            "Шаг операции не найден."
         )
 
     try:
         operation = (
             Operation.objects
             .select_for_update()
+            .select_related("change_ticket")
             .get(pk=step_reference.operation_id)
         )
+    except Operation.DoesNotExist:
+        raise OperationServiceError(
+            "Операция не найдена."
+        )
 
+    try:
         step = (
             StepExecution.objects
             .select_for_update()
@@ -132,284 +172,385 @@ def _lock_operation_and_step(step_execution_id):
                 operation=operation,
             )
         )
-
-    except Operation.DoesNotExist:
+    except StepExecution.DoesNotExist:
         raise OperationServiceError(
-            "Операция не найдена."
+            "Шаг не найден в указанной операции."
         )
 
     return operation, step
 
 
-# ============================================================
-# ПРОВЕРКА СТАТУСА ОПЕРАЦИИ
-# ============================================================
-
 def _require_running_operation(operation):
+    """
+    Проверяет, что операция находится в состоянии RUNNING.
+    """
+
     if operation.status != OperationStatus.RUNNING:
         raise OperationServiceError(
-            "Нельзя изменять шаги завершённой или остановленной операции."
+            "Нельзя выполнять действия: операция не находится в работе."
         )
 
 
-# ============================================================
-# НАЧАЛО ВЫПОЛНЕНИЯ ШАГА
-# ============================================================
-
-@transaction.atomic
-def start_step(*, step_execution_id, actor):
+def _get_card_status(code):
     """
-    Начинает выполнение доступного шага.
+    Получает статус карточки по его коду.
+    """
 
-    Предыдущий шаг должен быть завершён.
-    Одновременно может выполняться только один шаг операции.
+    try:
+        return CardStatus.objects.get(code=code)
+    except CardStatus.DoesNotExist:
+        raise OperationServiceError(
+            f"В справочнике не найден статус карточки: {code}."
+        )
 
-    Регистрирует событие STEP_STARTED.
+
+def _set_ticket_status(ticket, code):
+    """
+    Изменяет статус карточки изменения.
+    """
+
+    ticket.status = _get_card_status(code)
+    ticket.save(update_fields=["status"])
+
+
+def _set_operation_error(operation, error_text):
+    """
+    Записывает текст ошибки операции.
+
+    Учитывает возможные названия поля error_message и error.
+    """
+
+    concrete_field_names = {
+        field.name
+        for field in Operation._meta.concrete_fields
+    }
+
+    if "error_message" in concrete_field_names:
+        field_name = "error_message"
+    elif "error" in concrete_field_names:
+        field_name = "error"
+    else:
+        raise OperationServiceError(
+            "В модели Operation не найдено поле для хранения ошибки."
+        )
+
+    setattr(operation, field_name, error_text)
+
+    return field_name
+
+
+# ============================================================
+# АУДИТ
+# ============================================================
+
+def _record_operation_event(actor, action, operation, details=None):
+    """
+    Записывает событие, связанное с операцией.
+    """
+
+    record_event(
+        actor=actor,
+        action=action,
+        object_type=Operation._meta.label_lower,
+        object_id=operation.pk,
+        details=details or {},
+    )
+
+
+def _record_step_event(actor, action, step, details=None):
+    """
+    Записывает событие, связанное с конкретным шагом.
+    """
+
+    event_details = dict(details or {})
+    event_details["operation_id"] = str(step.operation_id)
+
+    record_event(
+        actor=actor,
+        action=action,
+        object_type=StepExecution._meta.label_lower,
+        object_id=step.pk,
+        details=event_details,
+    )
+
+
+# ============================================================
+# ВЫПОЛНЕНИЕ ОТДЕЛЬНЫХ ШАГОВ
+# ============================================================
+
+def start_step(step_execution_id, actor):
+    """
+    Начинает выполнение доступного шага операции.
+
+    Проверяет:
+    - права исполнителя;
+    - состояние операции;
+    - доступность шага;
+    - завершение предыдущих шагов;
+    - отсутствие другого выполняемого шага.
     """
 
     _require_executor(actor)
 
-    operation, step = _lock_operation_and_step(
-        step_execution_id
-    )
-
-    _require_running_operation(operation)
-
-    if step.status != StepExecutionStatus.AVAILABLE:
-        raise OperationServiceError(
-            "Этот шаг сейчас недоступен для выполнения."
+    with transaction.atomic():
+        operation, step = _lock_operation_and_step(
+            step_execution_id
         )
 
-    another_running_step = (
-        StepExecution.objects
-        .filter(
-            operation=operation,
-            status=StepExecutionStatus.IN_PROGRESS,
-        )
-        .exclude(pk=step.pk)
-        .exists()
-    )
+        _require_running_operation(operation)
 
-    if another_running_step:
-        raise OperationServiceError(
-            "Сначала необходимо завершить текущий шаг."
-        )
+        if step.status != StepExecutionStatus.AVAILABLE:
+            raise OperationServiceError(
+                "Этот шаг пока недоступен для выполнения."
+            )
 
-    if step.step_order > 1:
-        previous_step = (
+        another_running_step = (
             StepExecution.objects
             .filter(
                 operation=operation,
-                step_order=step.step_order - 1,
+                status=StepExecutionStatus.IN_PROGRESS,
             )
-            .first()
+            .exclude(pk=step.pk)
+            .exists()
         )
 
-        if (
-            previous_step is None
-            or previous_step.status != StepExecutionStatus.COMPLETED
-        ):
+        if another_running_step:
             raise OperationServiceError(
-                "Нельзя начать шаг, пока предыдущий "
-                "не завершён успешно."
+                "Нельзя начать новый шаг: другой шаг этой операции "
+                "ещё выполняется."
             )
 
-    step.status = StepExecutionStatus.IN_PROGRESS
-    step.started_by = actor
-    step.started_at = timezone.now()
+        previous_steps = StepExecution.objects.filter(
+            operation=operation,
+            step_order__lt=step.step_order,
+        )
 
-    step.full_clean()
+        if previous_steps.exclude(
+            status=StepExecutionStatus.COMPLETED
+        ).exists():
+            raise OperationServiceError(
+                "Нельзя начать шаг: предыдущие шаги ещё не завершены."
+            )
 
-    step.save(
-        update_fields=[
-            "status",
-            "started_by",
-            "started_at",
-            "updated_at",
-        ]
-    )
+        step.status = StepExecutionStatus.IN_PROGRESS
+        step.started_by = actor
+        step.started_at = timezone.now()
 
-    # Регистрируем начало шага в журнале аудита.
-    record_event(
-        actor=actor,
-        action=AuditAction.STEP_STARTED,
-        obj=step,
-        details={
-            "operation_id": str(operation.pk),
-            "step_order": step.step_order,
-            "step_kind": step.step_kind,
-        },
-    )
+        step.save(
+            update_fields=[
+                "status",
+                "started_by",
+                "started_at",
+            ]
+        )
+
+        _record_step_event(
+            actor=actor,
+            action=AuditAction.STEP_STARTED,
+            step=step,
+            details={
+                "step_order": step.step_order,
+                "step_name": step.name,
+            },
+        )
 
     return step
 
 
-# ============================================================
-# УСПЕШНОЕ ЗАВЕРШЕНИЕ ШАГА
-# ============================================================
-
-@transaction.atomic
-def complete_step(
-    *,
-    step_execution_id,
-    actor,
-    result="",
-):
+def complete_step(step_execution_id, actor, result=""):
     """
-    Завершает текущий шаг.
+    Завершает выполняемый шаг.
 
-    Если следующий шаг существует, он становится доступным.
-    Если все шаги завершены, завершается операция и обновляется
-    статус карточки изменения.
-
-    Все события регистрируются в журнале аудита
-    в рамках одной транзакции.
+    После завершения:
+    - следующий шаг становится доступным;
+    - при завершении всех шагов операция завершается;
+    - карточка получает итоговый статус;
+    - событие фиксируется в аудите.
     """
 
     _require_executor(actor)
 
-    operation, step = _lock_operation_and_step(
-        step_execution_id
-    )
-
-    _require_running_operation(operation)
-
-    if step.status != StepExecutionStatus.IN_PROGRESS:
-        raise OperationServiceError(
-            "Можно завершить только выполняющийся шаг."
+    with transaction.atomic():
+        operation, step = _lock_operation_and_step(
+            step_execution_id
         )
 
-    now = timezone.now()
+        _require_running_operation(operation)
 
-    step.status = StepExecutionStatus.COMPLETED
-    step.finished_by = actor
-    step.finished_at = now
-    step.result = result
-
-    step.full_clean()
-
-    step.save(
-        update_fields=[
-            "status",
-            "finished_by",
-            "finished_at",
-            "result",
-            "updated_at",
-        ]
-    )
-
-    # --------------------------------------------------------
-    # 1. РЕГИСТРИРУЕМ ЗАВЕРШЕНИЕ ШАГА
-    # --------------------------------------------------------
-
-    record_event(
-        actor=actor,
-        action=AuditAction.STEP_COMPLETED,
-        obj=step,
-        details={
-            "operation_id": str(operation.pk),
-            "step_order": step.step_order,
-            "step_kind": step.step_kind,
-        },
-    )
-
-    # --------------------------------------------------------
-    # 2. ПРОВЕРЯЕМ СЛЕДУЮЩИЙ ШАГ
-    # --------------------------------------------------------
-
-    next_step = (
-        StepExecution.objects
-        .select_for_update()
-        .filter(
-            operation=operation,
-            step_order=step.step_order + 1,
-        )
-        .first()
-    )
-
-    if next_step:
-
-        if next_step.status != StepExecutionStatus.LOCKED:
+        if step.status != StepExecutionStatus.IN_PROGRESS:
             raise OperationServiceError(
-                "Обнаружено некорректное состояние следующего шага."
+                "Завершить можно только шаг, который находится в работе."
             )
 
-        next_step.status = StepExecutionStatus.AVAILABLE
+        step.status = StepExecutionStatus.COMPLETED
+        step.finished_by = actor
+        step.finished_at = timezone.now()
+        step.result = result or ""
 
-        next_step.save(
-            update_fields=["status", "updated_at"]
+        step.save(
+            update_fields=[
+                "status",
+                "finished_by",
+                "finished_at",
+                "result",
+            ]
         )
 
-    else:
+        _record_step_event(
+            actor=actor,
+            action=AuditAction.STEP_COMPLETED,
+            step=step,
+            details={
+                "step_order": step.step_order,
+                "step_name": step.name,
+                "result": result or "",
+            },
+        )
 
-        unfinished_steps = (
+        # Разблокируем следующий шаг.
+        next_step = (
+            StepExecution.objects
+            .select_for_update()
+            .filter(
+                operation=operation,
+                step_order__gt=step.step_order,
+            )
+            .order_by("step_order")
+            .first()
+        )
+
+        if (
+            next_step
+            and next_step.status == StepExecutionStatus.LOCKED
+        ):
+            next_step.status = StepExecutionStatus.AVAILABLE
+            next_step.save(
+                update_fields=["status"]
+            )
+
+        # Проверяем, остались ли незавершённые шаги.
+        unfinished_steps_exist = (
             StepExecution.objects
             .filter(operation=operation)
             .exclude(status=StepExecutionStatus.COMPLETED)
             .exists()
         )
 
-        if unfinished_steps:
-            raise OperationServiceError(
-                "Не все шаги операции завершены."
+        if not unfinished_steps_exist:
+            operation.status = OperationStatus.COMPLETED
+            operation.finished_at = timezone.now()
+
+            # В модели Operation нет поля result.
+            # Результаты отдельных шагов хранятся в StepExecution.
+            operation.save(
+                update_fields=[
+                    "status",
+                    "finished_at",
+                ]
             )
 
-        # ----------------------------------------------------
-        # 3. ЗАВЕРШАЕМ ОПЕРАЦИЮ
-        # ----------------------------------------------------
+            if operation.operation_type == OperationType.ROLLBACK:
+                ticket_status = CardStatusCode.ROLLED_BACK
+            else:
+                ticket_status = CardStatusCode.COMPLETED
 
-        operation.status = OperationStatus.COMPLETED
-        operation.finished_at = now
+            _set_ticket_status(
+                operation.change_ticket,
+                ticket_status,
+            )
 
-        if result:
-            operation.result_summary = result
+            _record_operation_event(
+                actor=actor,
+                action=AuditAction.OPERATION_COMPLETED,
+                operation=operation,
+                details={
+                    "ticket_id": str(operation.change_ticket_id),
+                    "operation_type": operation.operation_type,
+                },
+            )
 
-        operation.full_clean()
+    return step
+
+
+def fail_step(step_execution_id, actor, error_message):
+    """
+    Завершает шаг с ошибкой и переводит операцию в FAILED.
+
+    Ошибка шага сохраняется в поле StepExecution.error_message.
+    Карточка остаётся в работе для последующей повторной попытки
+    или выполнения отката.
+    """
+
+    _require_executor(actor)
+
+    error_text = str(error_message or "").strip()
+
+    if not error_text:
+        raise OperationServiceError(
+            "Для завершения шага с ошибкой необходимо указать её причину."
+        )
+
+    with transaction.atomic():
+        operation, step = _lock_operation_and_step(
+            step_execution_id
+        )
+
+        _require_running_operation(operation)
+
+        if step.status != StepExecutionStatus.IN_PROGRESS:
+            raise OperationServiceError(
+                "Завершить с ошибкой можно только выполняемый шаг."
+            )
+
+        step.status = StepExecutionStatus.FAILED
+        step.finished_by = actor
+        step.finished_at = timezone.now()
+        step.error_message = error_text
+
+        step.save(
+            update_fields=[
+                "status",
+                "finished_by",
+                "finished_at",
+                "error_message",
+            ]
+        )
+
+        operation.status = OperationStatus.FAILED
+        operation.finished_at = timezone.now()
+
+        error_field = _set_operation_error(
+            operation,
+            error_text,
+        )
 
         operation.save(
             update_fields=[
                 "status",
                 "finished_at",
-                "result_summary",
-                "updated_at",
+                error_field,
             ]
         )
 
-        # ----------------------------------------------------
-        # 4. ОБНОВЛЯЕМ СТАТУС КАРТОЧКИ
-        # ----------------------------------------------------
-
-        ticket_status_code = (
-            CardStatusCode.COMPLETED
-            if operation.operation_type == OperationType.UPDATE
-            else CardStatusCode.ROLLED_BACK
-        )
-
-        ticket_status = CardStatus.objects.get(
-            code=ticket_status_code
-        )
-
-        ticket = operation.change_ticket
-        ticket.status = ticket_status
-
-        ticket.save(
-            update_fields=["status", "updated_at"]
-        )
-
-        # ----------------------------------------------------
-        # 5. РЕГИСТРИРУЕМ ЗАВЕРШЕНИЕ ОПЕРАЦИИ
-        # ----------------------------------------------------
-
-        record_event(
+        _record_step_event(
             actor=actor,
-            action=AuditAction.OPERATION_COMPLETED,
-            obj=operation,
+            action=AuditAction.STEP_FAILED,
+            step=step,
             details={
-                "operation_type": operation.operation_type,
-                "sequence_number": operation.sequence_number,
-                "attempt_number": operation.attempt_number,
-                "ticket_id": str(ticket.pk),
-                "ticket_status": ticket_status_code,
+                "step_order": step.step_order,
+                "step_name": step.name,
+                "error": error_text,
+            },
+        )
+
+        _record_operation_event(
+            actor=actor,
+            action=AuditAction.OPERATION_FAILED,
+            operation=operation,
+            details={
+                "ticket_id": str(operation.change_ticket_id),
+                "failed_step_id": str(step.pk),
+                "error": error_text,
             },
         )
 
@@ -417,251 +558,119 @@ def complete_step(
 
 
 # ============================================================
-# НЕУДАЧНОЕ ВЫПОЛНЕНИЕ ШАГА
+# ЗАПУСК ОБНОВЛЕНИЯ
 # ============================================================
 
-@transaction.atomic
-def fail_step(
-    *,
-    step_execution_id,
-    actor,
-    error_message,
-):
+def start_update_operation(ticket_id, actor):
     """
-    Фиксирует ошибку шага и завершает текущую операцию
-    со статусом FAILED.
+    Запускает операцию обновления программного обеспечения.
 
-    Карточка изменения остаётся в работе, чтобы можно было
-    принять решение о повторной попытке или откате.
-
-    События аудита сохраняются в той же транзакции.
+    Перед запуском проверяются:
+    - права исполнителя;
+    - принадлежность карточки пользователю;
+    - целевая установка;
+    - согласование;
+    - временное окно;
+    - совместимость;
+    - доступность ресурсов;
+    - последовательность плана;
+    - наличие пакета обновления;
+    - контрольная сумма SHA-256;
+    - отсутствие другой выполняющейся операции.
     """
 
     _require_executor(actor)
 
-    error_message = (error_message or "").strip()
-
-    if not error_message:
-        raise OperationServiceError(
-            "Необходимо указать причину ошибки."
-        )
-
-    operation, step = _lock_operation_and_step(
-        step_execution_id
-    )
-
-    _require_running_operation(operation)
-
-    if step.status != StepExecutionStatus.IN_PROGRESS:
-        raise OperationServiceError(
-            "Зафиксировать ошибку можно только "
-            "для выполняющегося шага."
-        )
-
-    now = timezone.now()
-
-    # --------------------------------------------------------
-    # 1. ФИКСИРУЕМ ОШИБКУ ШАГА
-    # --------------------------------------------------------
-
-    step.status = StepExecutionStatus.FAILED
-    step.finished_by = actor
-    step.finished_at = now
-    step.error_message = error_message
-
-    step.full_clean()
-
-    step.save(
-        update_fields=[
-            "status",
-            "finished_by",
-            "finished_at",
-            "error_message",
-            "updated_at",
-        ]
-    )
-
-    # --------------------------------------------------------
-    # 2. РЕГИСТРИРУЕМ ОШИБКУ ШАГА В AUDIT
-    # --------------------------------------------------------
-
-    record_event(
-        actor=actor,
-        action=AuditAction.STEP_FAILED,
-        obj=step,
-        details={
-            "operation_id": str(operation.pk),
-            "step_order": step.step_order,
-            "step_kind": step.step_kind,
-            "error_recorded": True,
-        },
-    )
-
-    # --------------------------------------------------------
-    # 3. ЗАВЕРШАЕМ ОПЕРАЦИЮ С ОШИБКОЙ
-    # --------------------------------------------------------
-
-    operation.status = OperationStatus.FAILED
-    operation.finished_at = now
-    operation.error_message = error_message
-
-    operation.full_clean()
-
-    operation.save(
-        update_fields=[
-            "status",
-            "finished_at",
-            "error_message",
-            "updated_at",
-        ]
-    )
-
-    # --------------------------------------------------------
-    # 4. РЕГИСТРИРУЕМ НЕУДАЧНОЕ ЗАВЕРШЕНИЕ ОПЕРАЦИИ
-    # --------------------------------------------------------
-
-    record_event(
-        actor=actor,
-        action=AuditAction.OPERATION_FAILED,
-        obj=operation,
-        details={
-            "operation_type": operation.operation_type,
-            "sequence_number": operation.sequence_number,
-            "attempt_number": operation.attempt_number,
-            "ticket_id": str(operation.change_ticket_id),
-        },
-    )
-
-    return step
-
-
-# ============================================================
-# ЗАПУСК ОПЕРАЦИИ ОБНОВЛЕНИЯ
-# ============================================================
-
-def start_update_operation(*, ticket_id, actor):
-    """
-    Запускает операцию обновления.
-
-    Проверяет карточку и пакет, создаёт операцию
-    и неизменяемые снимки плановых шагов.
-
-    Проверка SHA-256 выполняется до создания операции.
-    Результат проверки сохраняется даже при несовпадении хеша.
-
-    Успешный запуск регистрируется в журнале аудита.
-    """
-
-    _require_executor(actor)
-
-    hash_error_message = None
+    hash_mismatch = False
     operation = None
 
     with transaction.atomic():
-
         try:
             ticket = (
                 ChangeTicket.objects
                 .select_for_update()
-                .select_related("software", "status")
+                .select_related(
+                    "software",
+                    "status",
+                    "deployment_target",
+                )
                 .get(pk=ticket_id)
             )
-
         except ChangeTicket.DoesNotExist:
             raise OperationServiceError(
                 "Карточка изменения не найдена."
             )
 
-        # ----------------------------------------------------
-        # 1. ПРОВЕРКА ПРАВ
-        # ----------------------------------------------------
-
-        if ticket.created_by_id != actor.pk:
+        if ticket.created_by_id != actor.id:
             raise PermissionDenied(
-                "Запускать обновление может только исполнитель, "
-                "создавший карточку."
+                "Исполнитель может запускать обновление только "
+                "для собственной карточки изменения."
             )
 
-        if not ticket.software.is_active:
-            raise OperationServiceError(
-                "Нельзя обновлять неактивное программное обеспечение."
-            )
+        # Проверяем и блокируем целевую установку.
+        _lock_and_validate_deployment_target(ticket)
 
-        # ----------------------------------------------------
-        # 2. ПРОВЕРКА СТАТУСА КАРТОЧКИ
-        # ----------------------------------------------------
+        # Проверяем статус карточки.
+        if ticket.status.code == CardStatusCode.APPROVED:
+            pass
 
-        status_code = ticket.status.code
-
-        if status_code == CardStatusCode.IN_PROGRESS:
-
-            previous_operation = (
+        elif ticket.status.code == CardStatusCode.IN_PROGRESS:
+            last_update = (
                 Operation.objects
-                .filter(change_ticket=ticket)
-                .order_by("-sequence_number")
+                .filter(
+                    change_ticket=ticket,
+                    operation_type=OperationType.UPDATE,
+                )
+                .order_by("-attempt_number")
                 .first()
             )
 
             if (
-                previous_operation is None
-                or previous_operation.operation_type != OperationType.UPDATE
-                or previous_operation.status != OperationStatus.FAILED
+                last_update is None
+                or last_update.status != OperationStatus.FAILED
             ):
                 raise OperationServiceError(
-                    "Повторное обновление разрешено только "
-                    "после неудачной попытки обновления."
+                    "Повторный запуск обновления допустим только "
+                    "после неудачной предыдущей попытки."
                 )
 
-        elif status_code != CardStatusCode.APPROVED:
+        else:
             raise OperationServiceError(
-                "Запуск возможен только для согласованной карточки."
+                "Обновление можно запускать только для согласованной "
+                "карточки или после неудачной попытки обновления."
             )
 
         if not ticket.approved_by_id:
             raise OperationServiceError(
-                "У карточки отсутствует согласование руководителя."
+                "У карточки отсутствует подтверждение согласования."
             )
 
-        # ----------------------------------------------------
-        # 3. ПРОВЕРКА ПЛАНОВОГО ОКНА
-        # ----------------------------------------------------
-
+        # Проверяем плановое окно.
         now = timezone.now()
 
-        if not ticket.window_start_at or not ticket.window_end_at:
+        if ticket.window_start_at and now < ticket.window_start_at:
             raise OperationServiceError(
-                "У карточки не задано плановое окно."
+                "Плановое окно обновления ещё не началось."
             )
 
-        if not ticket.window_start_at <= now <= ticket.window_end_at:
+        if ticket.window_end_at and now > ticket.window_end_at:
             raise OperationServiceError(
-                "Запуск находится за пределами согласованного окна."
+                "Плановое окно обновления уже закончилось."
             )
 
-        # ----------------------------------------------------
-        # 4. ПРОВЕРКА ПРЕДПРОВЕРОК
-        # ----------------------------------------------------
-
-        if (
-            ticket.compatibility_status
-            != CompatibilityStatus.COMPATIBLE
-        ):
+        # Проверяем совместимость.
+        if ticket.compatibility_status != CompatibilityStatus.COMPATIBLE:
             raise OperationServiceError(
-                "Совместимость программного обеспечения не подтверждена."
+                "Не подтверждена совместимость обновления."
             )
 
-        if (
-            ticket.resources_check_status
-            != ResourcesCheckStatus.SUFFICIENT
-        ):
+        # Проверяем доступность ресурсов.
+        if ticket.resources_check_status != ResourcesCheckStatus.SUFFICIENT:
             raise OperationServiceError(
-                "Достаточность системных ресурсов не подтверждена."
+                "Не подтверждена достаточность ресурсов."
             )
 
-        # ----------------------------------------------------
-        # 5. ПРОВЕРКА ПЛАНОВЫХ ШАГОВ
-        # ----------------------------------------------------
-
+        # Получаем плановые шаги.
         plan_steps = list(
             PlanStep.objects
             .filter(ticket=ticket)
@@ -670,73 +679,58 @@ def start_update_operation(*, ticket_id, actor):
 
         if not plan_steps:
             raise OperationServiceError(
-                "В карточке отсутствуют плановые технические шаги."
+                "У карточки отсутствует план выполнения."
             )
 
-        expected_order = list(range(1, len(plan_steps) + 1))
+        expected_order = list(
+            range(1, len(plan_steps) + 1)
+        )
 
         actual_order = [
-            step.step_order for step in plan_steps
+            step.step_order
+            for step in plan_steps
         ]
 
         if actual_order != expected_order:
             raise OperationServiceError(
-                "Порядок плановых шагов должен быть непрерывным."
+                "Порядок плановых шагов должен быть последовательным, "
+                "начиная с единицы."
             )
 
         if plan_steps[0].step_kind != StepKind.BACKUP:
             raise OperationServiceError(
-                "Первым шагом должно быть резервное копирование."
+                "Первым шагом плана должно быть резервное копирование."
             )
 
-        # ----------------------------------------------------
-        # 6. ПРОВЕРКА ПАКЕТА
-        # ----------------------------------------------------
-
+        # Проверяем наличие пакета.
         if not ticket.package_file:
             raise OperationServiceError(
-                "В карточке отсутствует пакет обновления."
+                "Для карточки не загружен пакет обновления."
             )
 
         if not ticket.expected_sha256:
             raise OperationServiceError(
-                "Не указана ожидаемая SHA-256."
+                "Для пакета обновления не указана ожидаемая SHA-256."
             )
 
-        try:
-            actual_sha256 = _calculate_package_sha256(
-                ticket.package_file
-            )
+        # Вычисляем фактическую контрольную сумму.
+        actual_sha256 = _calculate_package_sha256(
+            ticket.package_file
+        )
 
-        except (OSError, ValueError):
-            actual_sha256 = ""
-            hash_error_message = (
-                "Не удалось прочитать пакет обновления. "
-                "Операция не запущена."
-            )
-
-        ticket.actual_sha256 = actual_sha256
-        ticket.hash_checked_at = now
-
-        if hash_error_message:
-
-            ticket.hash_status = HashStatus.MISMATCH
-
-        elif (
+        hash_mismatch = (
             actual_sha256.lower()
             != ticket.expected_sha256.lower()
-        ):
-            ticket.hash_status = HashStatus.MISMATCH
-            hash_error_message = (
-                "Контрольная сумма SHA-256 не совпадает. "
-                "Операция не создана."
-            )
+        )
 
-        else:
+        ticket.actual_sha256 = actual_sha256
+        ticket.hash_status = (
+            HashStatus.MISMATCH
+            if hash_mismatch
+            else HashStatus.MATCH
+        )
+        ticket.hash_checked_at = timezone.now()
 
-            ticket.hash_status = HashStatus.MATCH
-
-        # Сохраняем результат проверки независимо от её исхода.
         ticket.save(
             update_fields=[
                 "actual_sha256",
@@ -746,26 +740,21 @@ def start_update_operation(*, ticket_id, actor):
             ]
         )
 
-        # ----------------------------------------------------
-        # 7. СОЗДАНИЕ ОПЕРАЦИИ ПРИ УСПЕШНОЙ ПРОВЕРКЕ SHA-256
-        # ----------------------------------------------------
-
-        if hash_error_message is None:
-
+        if not hash_mismatch:
+            # Проверяем, что другая операция не выполняется.
             if Operation.objects.filter(
                 change_ticket=ticket,
                 status=OperationStatus.RUNNING,
             ).exists():
                 raise OperationServiceError(
-                    "Для карточки уже выполняется операция."
+                    "Для этой карточки уже выполняется другая операция."
                 )
 
             max_sequence = (
                 Operation.objects
                 .filter(change_ticket=ticket)
-                .aggregate(
-                    value=Max("sequence_number")
-                )["value"] or 0
+                .aggregate(value=Max("sequence_number"))["value"]
+                or 0
             )
 
             max_attempt = (
@@ -774,31 +763,23 @@ def start_update_operation(*, ticket_id, actor):
                     change_ticket=ticket,
                     operation_type=OperationType.UPDATE,
                 )
-                .aggregate(
-                    value=Max("attempt_number")
-                )["value"] or 0
+                .aggregate(value=Max("attempt_number"))["value"]
+                or 0
             )
 
-            operation = Operation(
+            # Создаём операцию обновления.
+            operation = Operation.objects.create(
                 change_ticket=ticket,
                 operation_type=OperationType.UPDATE,
                 sequence_number=max_sequence + 1,
                 attempt_number=max_attempt + 1,
                 initiated_by=actor,
                 status=OperationStatus.RUNNING,
-                started_at=now,
             )
 
-            operation.full_clean()
-            operation.save()
-
-            # ------------------------------------------------
-            # 8. СОЗДАЁМ СНИМКИ ПЛАНОВЫХ ШАГОВ
-            # ------------------------------------------------
-
-            for index, plan_step in enumerate(plan_steps):
-
-                execution = StepExecution(
+            # Создаём снимки плановых шагов.
+            for index, plan_step in enumerate(plan_steps, start=1):
+                StepExecution.objects.create(
                     operation=operation,
                     plan_step=plan_step,
                     step_order=plan_step.step_order,
@@ -808,166 +789,138 @@ def start_update_operation(*, ticket_id, actor):
                     planned_duration_min=plan_step.planned_duration_min,
                     status=(
                         StepExecutionStatus.AVAILABLE
-                        if index == 0
+                        if index == 1
                         else StepExecutionStatus.LOCKED
                     ),
                 )
 
-                execution.full_clean()
-                execution.save()
-
-            # ------------------------------------------------
-            # 9. ПЕРЕВОДИМ КАРТОЧКУ В РАБОТУ
-            # ------------------------------------------------
-
-            if status_code == CardStatusCode.APPROVED:
-
-                ticket.status = CardStatus.objects.get(
-                    code=CardStatusCode.IN_PROGRESS
+            # Переводим согласованную карточку в работу.
+            if ticket.status.code == CardStatusCode.APPROVED:
+                _set_ticket_status(
+                    ticket,
+                    CardStatusCode.IN_PROGRESS,
                 )
 
-                ticket.save(
-                    update_fields=["status", "updated_at"]
-                )
-
-            # ------------------------------------------------
-            # 10. РЕГИСТРИРУЕМ ЗАПУСК UPDATE В AUDIT
-            # ------------------------------------------------
-
-            # Важно: этот блок находится вне проверки APPROVED.
-            # Поэтому повторные попытки тоже попадут в аудит.
-
-            record_event(
+            _record_operation_event(
                 actor=actor,
                 action=AuditAction.UPDATE_STARTED,
-                obj=operation,
+                operation=operation,
                 details={
-                    "ticket_id": str(ticket.pk),
-                    "sequence_number": operation.sequence_number,
+                    "ticket_id": str(ticket.id),
+                    "software_id": str(ticket.software_id),
+                    "deployment_target_id": str(ticket.deployment_target_id),
                     "attempt_number": operation.attempt_number,
-                    "target_version": ticket.target_version,
                 },
             )
 
-    # --------------------------------------------------------
-    # 11. ВОЗВРАЩАЕМ ОШИБКУ ПОСЛЕ СОХРАНЕНИЯ РЕЗУЛЬТАТА ПРОВЕРКИ
-    # --------------------------------------------------------
-
-    if hash_error_message:
-        raise OperationServiceError(hash_error_message)
+    # Ошибку поднимаем за пределами транзакции,
+    # чтобы результат проверки SHA-256 сохранился в карточке.
+    if hash_mismatch:
+        raise OperationServiceError(
+            "Контрольная сумма пакета обновления не совпадает "
+            "с ожидаемой SHA-256. Запуск операции отменён."
+        )
 
     return operation
 
 
 # ============================================================
-# ЗАПУСК ОПЕРАЦИИ ОТКАТА
+# ЗАПУСК ОТКАТА
 # ============================================================
 
 def start_rollback_operation(
-    *,
     parent_operation_id,
     backup_id,
     rollback_reason_id,
     actor,
 ):
     """
-    Запускает операцию отката.
+    Запускает операцию отката к резервной копии.
 
-    Проверяет исходную операцию, карточку, причину отката
-    и резервную копию.
-
-    Перед созданием операции повторно проверяет SHA-256
-    и размер резервной копии.
-
-    Результат неудачной проверки резервной копии сохраняется,
-    но операция отката не создаётся.
-
-    Шаги отката формируются из активных StepTemplate
-    с operation_type=ROLLBACK.
+    Проверяются:
+    - права исполнителя;
+    - исходная операция обновления;
+    - принадлежность карточки;
+    - целевая установка;
+    - статус карточки;
+    - последняя попытка обновления;
+    - отсутствие другой выполняющейся операции;
+    - причина отката;
+    - принадлежность и целостность резервной копии;
+    - наличие шаблонов шагов отката.
     """
-
-    from backups.models import Backup
-    from backups.services import verify_backup
 
     _require_executor(actor)
 
-    verification_error_message = None
-    operation = None
+    # Локальные импорты помогают избежать возможных циклических импортов.
+    from backups.models import Backup
+    from backups.services import verify_backup
+
+    backup_verification_failed = False
+    rollback_operation = None
 
     with transaction.atomic():
-
-        # ----------------------------------------------------
-        # 1. БЛОКИРУЕМ ИСХОДНУЮ ОПЕРАЦИЮ
-        # ----------------------------------------------------
-
         try:
             parent_operation = (
                 Operation.objects
                 .select_for_update()
+                .select_related("change_ticket")
                 .get(pk=parent_operation_id)
             )
-
         except Operation.DoesNotExist:
             raise OperationServiceError(
-                "Исходная операция не найдена."
+                "Исходная операция обновления не найдена."
             )
 
         if parent_operation.operation_type != OperationType.UPDATE:
             raise OperationServiceError(
-                "Откат возможен только относительно операции обновления."
+                "Откат можно выполнить только для операции обновления."
             )
 
-        if parent_operation.status not in {
+        if parent_operation.status not in (
             OperationStatus.FAILED,
             OperationStatus.COMPLETED,
-        }:
+        ):
             raise OperationServiceError(
-                "Откат возможен только после завершения "
-                "или неудачной попытки обновления."
+                "Откат возможен только после завершения или ошибки обновления."
             )
 
-        # ----------------------------------------------------
-        # 2. БЛОКИРУЕМ КАРТОЧКУ И ПРОВЕРЯЕМ ПРАВА
-        # ----------------------------------------------------
-
-        try:
-            ticket = (
-                ChangeTicket.objects
-                .select_for_update()
-                .select_related("status")
-                .get(pk=parent_operation.change_ticket_id)
+        ticket = (
+            ChangeTicket.objects
+            .select_for_update()
+            .select_related(
+                "software",
+                "status",
+                "deployment_target",
             )
+            .get(pk=parent_operation.change_ticket_id)
+        )
 
-        except ChangeTicket.DoesNotExist:
-            raise OperationServiceError(
-                "Карточка изменения не найдена."
-            )
-
-        if ticket.created_by_id != actor.pk:
+        if ticket.created_by_id != actor.id:
             raise PermissionDenied(
-                "Запускать откат может только исполнитель, "
-                "создавший карточку изменения."
+                "Исполнитель может выполнять откат только "
+                "для собственной карточки изменения."
             )
 
-        if ticket.status.code not in {
+        # Проверяем целевую установку перед откатом.
+        _lock_and_validate_deployment_target(ticket)
+
+        if ticket.status.code not in (
             CardStatusCode.IN_PROGRESS,
             CardStatusCode.COMPLETED,
-        }:
+        ):
             raise OperationServiceError(
-                "Текущий статус карточки не допускает запуск отката."
+                "Текущий статус карточки не допускает выполнение отката."
             )
 
-        # ----------------------------------------------------
-        # 3. ПРОВЕРЯЕМ АКТУАЛЬНОСТЬ ИСХОДНОЙ ОПЕРАЦИИ
-        # ----------------------------------------------------
-
+        # Откат допускается только для последней попытки обновления.
         latest_update = (
             Operation.objects
             .filter(
                 change_ticket=ticket,
                 operation_type=OperationType.UPDATE,
             )
-            .order_by("-sequence_number")
+            .order_by("-attempt_number")
             .first()
         )
 
@@ -976,109 +929,92 @@ def start_rollback_operation(
             or latest_update.pk != parent_operation.pk
         ):
             raise OperationServiceError(
-                "Откат разрешён только для последней "
-                "операции обновления карточки."
+                "Откат можно выполнить только для последней попытки обновления."
             )
 
-        if parent_operation.rollback_operations.filter(
-            status=OperationStatus.COMPLETED
+        # Проверяем, не был ли уже успешно выполнен откат.
+        if Operation.objects.filter(
+            change_ticket=ticket,
+            operation_type=OperationType.ROLLBACK,
+            status=OperationStatus.COMPLETED,
         ).exists():
             raise OperationServiceError(
-                "Для этой операции обновления откат уже успешно выполнен."
+                "Для этой карточки уже существует успешно завершённый откат."
             )
 
+        # Одновременно может выполняться только одна операция.
         if Operation.objects.filter(
             change_ticket=ticket,
             status=OperationStatus.RUNNING,
         ).exists():
             raise OperationServiceError(
-                "По этой карточке уже выполняется другая операция."
+                "Для этой карточки уже выполняется другая операция."
             )
 
-        # ----------------------------------------------------
-        # 4. ПРОВЕРЯЕМ ПРИЧИНУ ОТКАТА
-        # ----------------------------------------------------
-
+        # Проверяем причину отката.
         try:
-            rollback_reason = RollbackReason.objects.get(
-                pk=rollback_reason_id,
-                is_active=True,
+            rollback_reason = (
+                RollbackReason.objects
+                .select_for_update()
+                .get(
+                    pk=rollback_reason_id,
+                    is_active=True,
+                )
             )
-
         except RollbackReason.DoesNotExist:
             raise OperationServiceError(
                 "Причина отката не найдена или неактивна."
             )
 
-        # ----------------------------------------------------
-        # 5. ПОЛУЧАЕМ РЕЗЕРВНУЮ КОПИЮ
-        # ----------------------------------------------------
-
+        # Получаем резервную копию.
         try:
             backup = (
                 Backup.objects
                 .select_for_update()
                 .get(pk=backup_id)
             )
-
         except Backup.DoesNotExist:
             raise OperationServiceError(
                 "Резервная копия не найдена."
             )
 
-        if backup.operation_id != parent_operation.pk:
+        if backup.operation_id != parent_operation.id:
             raise OperationServiceError(
                 "Выбранная резервная копия не относится "
                 "к исходной операции обновления."
             )
 
-        # ----------------------------------------------------
-        # 6. ПОЛУЧАЕМ ШАБЛОНЫ ШАГОВ ОТКАТА
-        # ----------------------------------------------------
-
+        # Получаем активные шаблоны шагов отката.
         templates = list(
             StepTemplate.objects
             .filter(
                 operation_type=OperationType.ROLLBACK,
                 is_active=True,
             )
-            .order_by("sort_order", "name")
+            .order_by("sort_order")
         )
 
         if not templates:
             raise OperationServiceError(
-                "Не найдены активные шаблоны шагов отката. "
-                "Сначала необходимо настроить StepTemplate."
+                "Не настроены шаблоны шагов для операции отката."
             )
 
-        # ----------------------------------------------------
-        # 7. ПОВТОРНАЯ ПРОВЕРКА РЕЗЕРВНОЙ КОПИИ
-        # ----------------------------------------------------
-
+        # Повторно проверяем реальное содержимое файла.
+        # verify_backup сохраняет результат проверки в базе.
         verified_backup = verify_backup(
-            backup_id=backup.pk,
+            backup_id=backup.id,
             actor=actor,
         )
 
         if not verified_backup.is_usable:
+            backup_verification_failed = True
 
-            verification_error_message = (
-                verified_backup.verification_error
-                or "Целостность резервной копии не подтверждена."
-            )
-
-        else:
-
-            # ------------------------------------------------
-            # 8. РАССЧИТЫВАЕМ НОМЕРА ОПЕРАЦИИ И ПОПЫТКИ
-            # ------------------------------------------------
-
+        if not backup_verification_failed:
             max_sequence = (
                 Operation.objects
                 .filter(change_ticket=ticket)
-                .aggregate(
-                    value=Max("sequence_number")
-                )["value"] or 0
+                .aggregate(value=Max("sequence_number"))["value"]
+                or 0
             )
 
             max_attempt = (
@@ -1087,18 +1023,12 @@ def start_rollback_operation(
                     change_ticket=ticket,
                     operation_type=OperationType.ROLLBACK,
                 )
-                .aggregate(
-                    value=Max("attempt_number")
-                )["value"] or 0
+                .aggregate(value=Max("attempt_number"))["value"]
+                or 0
             )
 
-            now = timezone.now()
-
-            # ------------------------------------------------
-            # 9. СОЗДАЁМ ОПЕРАЦИЮ ОТКАТА
-            # ------------------------------------------------
-
-            operation = Operation(
+            # Создаём операцию отката.
+            rollback_operation = Operation.objects.create(
                 change_ticket=ticket,
                 operation_type=OperationType.ROLLBACK,
                 sequence_number=max_sequence + 1,
@@ -1108,79 +1038,51 @@ def start_rollback_operation(
                 rollback_reason=rollback_reason,
                 initiated_by=actor,
                 status=OperationStatus.RUNNING,
-                started_at=now,
             )
 
-            operation.full_clean()
-            operation.save()
-
-            # ------------------------------------------------
-            # 10. СОЗДАЁМ СОБСТВЕННЫЕ ШАГИ ОТКАТА
-            # ------------------------------------------------
-
-            for index, template in enumerate(templates):
-
-                execution = StepExecution(
-                    operation=operation,
+            # Создаём снимки шаблонов шагов отката.
+            for index, template in enumerate(templates, start=1):
+                StepExecution.objects.create(
+                    operation=rollback_operation,
                     plan_step=None,
-                    step_order=index + 1,
+                    step_order=index,
                     step_kind=template.step_kind,
                     name=template.name,
                     description=template.description,
                     planned_duration_min=template.default_duration_min,
                     status=(
                         StepExecutionStatus.AVAILABLE
-                        if index == 0
+                        if index == 1
                         else StepExecutionStatus.LOCKED
                     ),
                 )
 
-                execution.full_clean()
-                execution.save()
-
-            # ------------------------------------------------
-            # 11. ВОЗВРАЩАЕМ КАРТОЧКУ В РАБОТУ
-            # ------------------------------------------------
-
+            # Возвращаем завершённую карточку в работу.
             if ticket.status.code == CardStatusCode.COMPLETED:
-
-                ticket.status = CardStatus.objects.get(
-                    code=CardStatusCode.IN_PROGRESS
+                _set_ticket_status(
+                    ticket,
+                    CardStatusCode.IN_PROGRESS,
                 )
 
-                ticket.save(
-                    update_fields=["status", "updated_at"]
-                )
-
-            # ------------------------------------------------
-            # 12. РЕГИСТРИРУЕМ ЗАПУСК ROLLBACK В AUDIT
-            # ------------------------------------------------
-
-            # Этот блок выполняется при любом допустимом
-            # статусе карточки: IN_PROGRESS или COMPLETED.
-
-            record_event(
+            _record_operation_event(
                 actor=actor,
                 action=AuditAction.ROLLBACK_STARTED,
-                obj=operation,
+                operation=rollback_operation,
                 details={
-                    "ticket_id": str(ticket.pk),
-                    "parent_operation_id": str(parent_operation.pk),
-                    "backup_id": str(verified_backup.pk),
-                    "rollback_reason_id": str(rollback_reason.pk),
-                    "sequence_number": operation.sequence_number,
-                    "attempt_number": operation.attempt_number,
+                    "ticket_id": str(ticket.id),
+                    "parent_operation_id": str(parent_operation.id),
+                    "backup_id": str(verified_backup.id),
+                    "rollback_reason_id": str(rollback_reason.id),
+                    "attempt_number": rollback_operation.attempt_number,
                 },
             )
 
-    # --------------------------------------------------------
-    # 13. СООБЩАЕМ ОБ ОШИБКЕ ПОСЛЕ ЗАВЕРШЕНИЯ ТРАНЗАКЦИИ
-    # --------------------------------------------------------
-
-    if verification_error_message:
+    # Поднимаем ошибку за пределами транзакции,
+    # чтобы результат проверки резервной копии сохранился.
+    if backup_verification_failed:
         raise OperationServiceError(
-            "Резервная копия не прошла проверку целостности. "
-            + verification_error_message
+            "Проверка резервной копии завершилась неудачно. "
+            "Запуск отката отменён."
         )
 
-    return operation
+    return rollback_operation

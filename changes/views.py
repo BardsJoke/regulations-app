@@ -1,3 +1,4 @@
+
 from django.core.exceptions import ValidationError
 from django.shortcuts import redirect
 
@@ -87,7 +88,7 @@ class ChangeTicketViewSet(ModelViewSet):
     edit_view_class = ChangeTicketEditView
 
     form_fields = [
-        "software",
+        "deployment_target",
         "source_version",
         "target_version",
         "risks",
@@ -105,6 +106,7 @@ class ChangeTicketViewSet(ModelViewSet):
     add_to_admin_menu = True
 
     list_display = [
+        "deployment_target",
         "software",
         "source_version",
         "target_version",
@@ -117,10 +119,12 @@ class ChangeTicketViewSet(ModelViewSet):
 
     list_filter = [
         "status",
+        "deployment_target",
         "software",
     ]
 
     search_fields = [
+        "deployment_target__name",
         "software__name",
         "source_version",
         "target_version",
@@ -133,6 +137,7 @@ class ChangeTicketViewSet(ModelViewSet):
     inspect_view_enabled = True
 
     inspect_view_fields = [
+        "deployment_target",
         "software",
         "created_by",
         "approved_by",

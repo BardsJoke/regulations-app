@@ -15,6 +15,11 @@ from catalogs.models import (
     MuseumSoftware,
     SoftwareType,
 )
+from deployments.models import (
+    DeploymentAdapterType,
+    DeploymentEnvironment,
+    DeploymentTarget,
+)
 
 from .models import (
     ApprovalDecision,
@@ -23,9 +28,14 @@ from .models import (
     PlanStep,
     StepKind,
 )
+
 from .permissions import ChangeTicketPermissionPolicy
+
 from .services import (
     ChangeWorkflowError,
+    add_plan_step,
+    update_plan_step,
+    delete_plan_step,
     approve_ticket,
     cancel_ticket,
     create_draft,
@@ -80,6 +90,16 @@ class ChangeWorkflowTests(TestCase):
             current_version="1.0",
         )
 
+        # Создаём настроенную тестовую целевую установку.
+        self.deployment_target = DeploymentTarget.objects.create(
+            software=self.software,
+            name="Тестовая установка",
+            environment=DeploymentEnvironment.TEST,
+            adapter_type=DeploymentAdapterType.LOCAL_FILESYSTEM,
+            config_key="tests.museum_system",
+            is_active=True,
+        )
+
         # Плановое окно для тестов.
         self.window_start = timezone.now() + timedelta(days=2)
         self.window_end = self.window_start + timedelta(hours=2)
@@ -92,7 +112,7 @@ class ChangeWorkflowTests(TestCase):
 
         ticket = create_draft(
             actor=self.executor,
-            software=self.software,
+            deployment_target=self.deployment_target,
             source_version="1.0",
             target_version="1.1",
             risks="Тестовое описание рисков",
@@ -151,6 +171,17 @@ class ChangeWorkflowTests(TestCase):
             self.executor,
         )
 
+        self.assertEqual(
+            ticket.deployment_target,
+            self.deployment_target,
+        )
+
+        # ПО автоматически определяется через установку.
+        self.assertEqual(
+            ticket.software,
+            self.software,
+        )
+
         self._assert_audit_event(
             ticket=ticket,
             actor=self.executor,
@@ -161,8 +192,30 @@ class ChangeWorkflowTests(TestCase):
         with self.assertRaises(PermissionDenied):
             create_draft(
                 actor=self.approver,
-                software=self.software,
+                deployment_target=self.deployment_target,
             )
+
+    def test_executor_cannot_create_draft_for_inactive_target(self):
+        DeploymentTarget.objects.filter(
+            pk=self.deployment_target.pk,
+        ).update(is_active=False)
+
+        with self.assertRaises(ChangeWorkflowError):
+            create_draft(
+                actor=self.executor,
+                deployment_target=self.deployment_target,
+            )
+
+        self.assertEqual(
+            ChangeTicket.objects.count(),
+            0,
+        )
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_CREATED,
+            ).exists()
+        )
 
     # -----------------------------------------------------
     # РЕДАКТИРОВАНИЕ ЧЕРНОВИКА
@@ -174,7 +227,7 @@ class ChangeWorkflowTests(TestCase):
         result = update_draft(
             ticket_id=ticket.pk,
             actor=self.executor,
-            software=self.software,
+            deployment_target=self.deployment_target,
             source_version="1.0",
             target_version="1.2",
             risks="Обновлённое описание рисков",
@@ -190,6 +243,11 @@ class ChangeWorkflowTests(TestCase):
         self.assertEqual(
             result.risks,
             "Обновлённое описание рисков",
+        )
+
+        self.assertEqual(
+            result.deployment_target,
+            self.deployment_target,
         )
 
         event = self._assert_audit_event(
@@ -268,6 +326,55 @@ class ChangeWorkflowTests(TestCase):
                 actor=another_executor,
             )
 
+    def test_legacy_ticket_without_target_cannot_be_submitted(self):
+        """
+        Историческая карточка без целевой установки
+        должна сохраниться, но не может перейти к согласованию.
+        """
+
+        ticket = ChangeTicket.objects.create(
+            software=self.software,
+            created_by=self.executor,
+            status=CardStatus.objects.get(
+                code=CardStatusCode.DRAFT,
+            ),
+            source_version="1.0",
+            target_version="1.1",
+            window_start_at=self.window_start,
+            window_end_at=self.window_end,
+        )
+
+        PlanStep.objects.create(
+            ticket=ticket,
+            step_order=1,
+            step_kind=StepKind.BACKUP,
+            name="Создать резервную копию",
+            planned_duration_min=15,
+        )
+
+        self.assertIsNone(ticket.deployment_target_id)
+
+        with self.assertRaises(ChangeWorkflowError):
+            submit_for_approval(
+                ticket_id=ticket.pk,
+                actor=self.executor,
+            )
+
+        ticket.refresh_from_db()
+
+        self.assertEqual(
+            ticket.status.code,
+            CardStatusCode.DRAFT,
+        )
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_SUBMITTED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).exists()
+        )
+
     # -----------------------------------------------------
     # СОГЛАСОВАНИЕ
     # -----------------------------------------------------
@@ -319,6 +426,40 @@ class ChangeWorkflowTests(TestCase):
                 ticket_id=ticket.pk,
                 actor=self.approver,
             )
+
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_APPROVED,
+                object_id=ticket.pk,
+            ).exists()
+        )
+
+    def test_approver_cannot_approve_when_target_becomes_inactive(self):
+        ticket = self.submit_test_draft()
+
+        DeploymentTarget.objects.filter(
+            pk=self.deployment_target.pk,
+        ).update(is_active=False)
+
+        with self.assertRaises(ChangeWorkflowError):
+            approve_ticket(
+                ticket_id=ticket.pk,
+                actor=self.approver,
+            )
+
+        ticket.refresh_from_db()
+
+        self.assertEqual(
+            ticket.status.code,
+            CardStatusCode.PENDING,
+        )
+
+        self.assertFalse(
+            ApprovalRecord.objects.filter(
+                ticket=ticket,
+                decision=ApprovalDecision.APPROVED,
+            ).exists()
+        )
 
         self.assertFalse(
             AuditEvent.objects.filter(
@@ -590,9 +731,170 @@ class ChangeWorkflowTests(TestCase):
             ).count(),
             2,
         )
+    
+    # -----------------------------------------------------
+    # УПРАВЛЕНИЕ ПЛАНОВЫМИ ШАГАМИ
+    # -----------------------------------------------------
+
+    def test_executor_can_add_plan_step(self):
+        ticket = self.create_test_draft()
+
+        step = add_plan_step(
+            ticket_id=ticket.pk,
+            actor=self.executor,
+            step_kind=StepKind.UPDATE,
+            name="Установить обновление",
+            description="Установка новой версии ПО.",
+            planned_duration_min=30,
+        )
+
+        self.assertEqual(step.step_order, 2)
+        self.assertEqual(step.ticket, ticket)
+
+        self.assertTrue(
+            PlanStep.objects.filter(
+                pk=step.pk,
+                ticket=ticket,
+            ).exists()
+        )
+
+        events = AuditEvent.objects.filter(
+            action=AuditAction.CHANGE_UPDATED,
+            object_type="changes.changeticket",
+            object_id=ticket.pk,
+        )
+
+        self.assertTrue(
+            any(
+                event.details.get("operation") == "plan_step_added"
+                for event in events
+            )
+        )
+
+    def test_executor_can_update_plan_step(self):
+        ticket = self.create_test_draft()
+        step = ticket.plan_steps.get(step_order=1)
+
+        result = update_plan_step(
+            ticket_id=ticket.pk,
+            step_id=step.pk,
+            actor=self.executor,
+            step_kind=StepKind.BACKUP,
+            name="Создать полную резервную копию",
+            description="Копирование файлов и данных.",
+            planned_duration_min=25,
+        )
+
+        self.assertEqual(
+            result.name,
+            "Создать полную резервную копию",
+        )
+
+        self.assertEqual(result.planned_duration_min, 25)
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.CHANGE_UPDATED,
+                object_type="changes.changeticket",
+                object_id=ticket.pk,
+            ).exists()
+        )
+
+    def test_executor_can_delete_last_plan_step(self):
+        ticket = self.create_test_draft()
+
+        step = add_plan_step(
+            ticket_id=ticket.pk,
+            actor=self.executor,
+            step_kind=StepKind.UPDATE,
+            name="Установить обновление",
+            planned_duration_min=30,
+        )
+
+        delete_plan_step(
+            ticket_id=ticket.pk,
+            step_id=step.pk,
+            actor=self.executor,
+        )
+
+        self.assertFalse(
+            PlanStep.objects.filter(pk=step.pk).exists()
+        )
+
+        self.assertEqual(
+            ticket.plan_steps.count(),
+            1,
+        )
+
+    def test_cannot_delete_middle_plan_step(self):
+        ticket = self.create_test_draft()
+
+        second_step = add_plan_step(
+            ticket_id=ticket.pk,
+            actor=self.executor,
+            step_kind=StepKind.UPDATE,
+            name="Установить обновление",
+            planned_duration_min=30,
+        )
+
+        add_plan_step(
+            ticket_id=ticket.pk,
+            actor=self.executor,
+            step_kind=StepKind.VERIFICATION,
+            name="Проверить результат",
+            planned_duration_min=15,
+        )
+
+        with self.assertRaises(ChangeWorkflowError):
+            delete_plan_step(
+                ticket_id=ticket.pk,
+                step_id=second_step.pk,
+                actor=self.executor,
+            )
+
+        self.assertTrue(
+            PlanStep.objects.filter(pk=second_step.pk).exists()
+        )
+
+    def test_plan_cannot_be_changed_after_submission(self):
+        ticket = self.submit_test_draft()
+
+        with self.assertRaises(ChangeWorkflowError):
+            add_plan_step(
+                ticket_id=ticket.pk,
+                actor=self.executor,
+                step_kind=StepKind.UPDATE,
+                name="Запрещённый шаг",
+                planned_duration_min=20,
+            )
+
+        step = ticket.plan_steps.get(step_order=1)
+
+        with self.assertRaises(ChangeWorkflowError):
+            update_plan_step(
+                ticket_id=ticket.pk,
+                step_id=step.pk,
+                actor=self.executor,
+                step_kind=StepKind.BACKUP,
+                name="Попытка изменить утверждаемый план",
+                planned_duration_min=30,
+            )
+
+        with self.assertRaises(ChangeWorkflowError):
+            delete_plan_step(
+                ticket_id=ticket.pk,
+                step_id=step.pk,
+                actor=self.executor,
+            )
+
+        self.assertEqual(ticket.plan_steps.count(), 1)
+
 
 
 class ChangeTicketMultiRolePermissionTests(TestCase):
+    """
+    Проверка объединения прав пользователя с несколькими ролями.
+    """
 
     def setUp(self):
         self.executor = User.objects.create_user(
@@ -628,7 +930,7 @@ class ChangeTicketMultiRolePermissionTests(TestCase):
             current_version="1.0",
         )
 
-        # Собственная карточка исполнителя.
+        # Собственная историческая карточка исполнителя.
         self.own_ticket = ChangeTicket.objects.create(
             software=self.software,
             created_by=self.executor,
@@ -639,7 +941,7 @@ class ChangeTicketMultiRolePermissionTests(TestCase):
             target_version="2.0",
         )
 
-        # Чужая карточка на согласовании.
+        # Чужая историческая карточка на согласовании.
         self.other_ticket = ChangeTicket.objects.create(
             software=self.software,
             created_by=self.other_user,

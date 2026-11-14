@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     "operations.apps.OperationsConfig",
     "backups.apps.BackupsConfig",
     "audit.apps.AuditConfig",
+    "deployments.apps.DeploymentsConfig",
     "wagtail.contrib.forms",
     "wagtail.contrib.redirects",
     "wagtail.embeds",

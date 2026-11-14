@@ -5,6 +5,7 @@ from django.db import transaction
 from access.models import ModuleRole, RoleAssignment
 from audit.services import AuditAction, record_event
 from catalogs.models import CardStatus, CardStatusCode
+from deployments.models import DeploymentTarget
 
 from .models import (
     ApprovalDecision,
@@ -77,11 +78,96 @@ def _get_locked_ticket(ticket_id):
         return (
             ChangeTicket.objects
             .select_for_update()
-            .select_related("status", "software")
+            .select_related(
+                "status",
+                "software",
+                "deployment_target",
+                "deployment_target__software",
+            )
             .get(pk=ticket_id)
         )
     except ChangeTicket.DoesNotExist:
         raise ChangeWorkflowError("Карточка изменения не найдена.")
+
+
+def _get_locked_deployment_target(target_or_id):
+    """
+    Получает целевую установку с блокировкой строки.
+
+    Принимает как объект DeploymentTarget, так и его UUID.
+    Повторно загружает объект из базы, чтобы работать
+    с актуальными данными внутри транзакции.
+    """
+
+    target_id = getattr(target_or_id, "pk", target_or_id)
+
+    if not target_id:
+        raise ChangeWorkflowError(
+            "Необходимо выбрать целевую установку."
+        )
+
+    try:
+        return (
+            DeploymentTarget.objects
+            .select_for_update()
+            .select_related("software")
+            .get(pk=target_id)
+        )
+    except DeploymentTarget.DoesNotExist:
+        raise ChangeWorkflowError(
+            "Выбранная целевая установка не найдена."
+        )
+
+
+def _require_usable_deployment_target(target):
+    """
+    Проверяет, разрешено ли использовать установку
+    для создания или согласования изменения.
+    """
+
+    if not target.is_active:
+        raise ChangeWorkflowError(
+            "Выбранная целевая установка неактивна."
+        )
+
+    if not target.is_configured:
+        raise ChangeWorkflowError(
+            "Целевая установка ещё не настроена."
+        )
+
+    if not target.software.is_active:
+        raise ChangeWorkflowError(
+            "Программное обеспечение этой установки неактивно."
+        )
+
+
+def _validate_ticket_target(ticket):
+    """
+    Проверяет наличие и доступность установки у карточки.
+
+    Возвращает актуальную целевую установку,
+    заблокированную на время текущей транзакции.
+    """
+
+    if not ticket.deployment_target_id:
+        raise ChangeWorkflowError(
+            "Для этой карточки не выбрана целевая установка. "
+            "Укажите установку перед продолжением согласования."
+        )
+
+    target = _get_locked_deployment_target(
+        ticket.deployment_target_id
+    )
+
+    if target.software_id != ticket.software_id:
+        raise ChangeWorkflowError(
+            "Целевая установка относится к другому "
+            "программному обеспечению."
+        )
+
+    _require_usable_deployment_target(target)
+
+    return target
 
 
 def _validate_new_window(start_at, end_at):
@@ -106,26 +192,32 @@ def _validate_new_window(start_at, end_at):
 def create_draft(
     *,
     actor,
-    software,
+    deployment_target,
     source_version="",
     target_version="",
     risks="",
     window_start_at=None,
     window_end_at=None,
 ):
-    """Создаёт новую карточку в статусе draft."""
+    """
+    Создаёт новую карточку в статусе draft.
+
+    Программное обеспечение определяется через выбранную
+    целевую установку.
+    """
 
     _require_role(actor, ModuleRole.EXECUTOR)
 
-    if not software.is_active:
-        raise ChangeWorkflowError(
-            "Нельзя создать карточку для неактивного ПО."
-        )
+    target = _get_locked_deployment_target(deployment_target)
+    _require_usable_deployment_target(target)
+
+    software = target.software
 
     draft_status = _get_status(CardStatusCode.DRAFT)
 
     ticket = ChangeTicket(
         software=software,
+        deployment_target=target,
         created_by=actor,
         status=draft_status,
         source_version=source_version,
@@ -144,6 +236,9 @@ def create_draft(
         obj=ticket,
         details={
             "software_id": str(ticket.software_id),
+            "deployment_target_id": str(target.pk),
+            "environment": target.environment,
+            "adapter_type": target.adapter_type,
             "status": ticket.status.code,
             "source_version": ticket.source_version,
             "target_version": ticket.target_version,
@@ -172,10 +267,8 @@ def submit_for_approval(*, ticket_id, actor):
             "На согласование можно отправить только черновик."
         )
 
-    if not ticket.software.is_active:
-        raise ChangeWorkflowError(
-            "Программное обеспечение неактивно."
-        )
+    # Проверяем, что карточка связана с доступной установкой.
+    _validate_ticket_target(ticket)
 
     _validate_new_window(
         ticket.window_start_at,
@@ -213,6 +306,7 @@ def submit_for_approval(*, ticket_id, actor):
         details={
             "status_before": CardStatusCode.DRAFT,
             "status_after": ticket.status.code,
+            "deployment_target_id": str(ticket.deployment_target_id),
         },
     )
 
@@ -237,6 +331,9 @@ def approve_ticket(*, ticket_id, actor, comment=""):
         raise ChangeWorkflowError(
             "Согласовать можно только карточку на согласовании."
         )
+
+    # Повторно проверяем установку непосредственно перед решением.
+    _validate_ticket_target(ticket)
 
     old_status = ticket.status
 
@@ -268,6 +365,7 @@ def approve_ticket(*, ticket_id, actor, comment=""):
             "approval_record_id": str(approval_record.pk),
             "status_before": old_status.code,
             "status_after": ticket.status.code,
+            "deployment_target_id": str(ticket.deployment_target_id),
         },
     )
 
@@ -374,6 +472,11 @@ def reschedule_ticket(
         )
 
     _validate_new_window(new_start_at, new_end_at)
+
+    # Перенос карточки на согласовании фактически приводит
+    # к её утверждению, поэтому установка должна быть доступна.
+    if current_status == CardStatusCode.PENDING:
+        _validate_ticket_target(ticket)
 
     old_start_at = ticket.window_start_at
     old_end_at = ticket.window_end_at
@@ -501,7 +604,7 @@ def update_draft(
     *,
     ticket_id,
     actor,
-    software,
+    deployment_target,
     source_version="",
     target_version="",
     risks="",
@@ -513,6 +616,9 @@ def update_draft(
 
     Исполнитель может редактировать только собственные
     карточки, пока они находятся в статусе draft.
+
+    Программное обеспечение автоматически определяется
+    по выбранной целевой установке.
     """
 
     _require_role(actor, ModuleRole.EXECUTOR)
@@ -526,10 +632,18 @@ def update_draft(
             "Редактировать можно только карточку в статусе «Черновик»."
         )
 
+    target = _get_locked_deployment_target(deployment_target)
+    _require_usable_deployment_target(target)
+
+    software = target.software
+
     changed_fields = []
 
     if ticket.software_id != software.pk:
         changed_fields.append("software")
+
+    if ticket.deployment_target_id != target.pk:
+        changed_fields.append("deployment_target")
 
     if ticket.source_version != source_version:
         changed_fields.append("source_version")
@@ -546,12 +660,8 @@ def update_draft(
     if ticket.window_end_at != window_end_at:
         changed_fields.append("window_end_at")
 
-    if not software.is_active and software.pk != ticket.software_id:
-        raise ChangeWorkflowError(
-            "Нельзя выбрать неактивное программное обеспечение."
-        )
-
     ticket.software = software
+    ticket.deployment_target = target
     ticket.source_version = source_version
     ticket.target_version = target_version
     ticket.risks = risks
@@ -563,6 +673,7 @@ def update_draft(
     ticket.save(
         update_fields=[
             "software",
+            "deployment_target",
             "source_version",
             "target_version",
             "risks",
@@ -578,7 +689,236 @@ def update_draft(
         obj=ticket,
         details={
             "changed_fields": changed_fields,
+            "deployment_target_id": str(target.pk),
             "status": ticket.status.code,
+        },
+    )
+    return ticket
+
+# ---------------------------------------------------------
+# УПРАВЛЕНИЕ ПЛАНОВЫМИ ШАГАМИ
+# ---------------------------------------------------------
+
+
+def _get_locked_draft_for_plan(*, ticket_id, actor):
+    """
+    Получает карточку с блокировкой и проверяет,
+    что исполнитель может изменять её план.
+    """
+
+    _require_role(actor, ModuleRole.EXECUTOR)
+
+    ticket = _get_locked_ticket(ticket_id)
+
+    _require_ticket_creator(actor, ticket)
+
+    if ticket.status.code != CardStatusCode.DRAFT:
+        raise ChangeWorkflowError(
+            "Изменять плановые шаги можно только в черновике."
+        )
+
+    return ticket
+
+
+@transaction.atomic
+def add_plan_step(
+    *,
+    ticket_id,
+    actor,
+    step_kind,
+    name,
+    planned_duration_min,
+    description="",
+):
+    """
+    Добавляет новый шаг в конец плана черновика.
+
+    Нумерация определяется автоматически.
+    """
+
+    ticket = _get_locked_draft_for_plan(
+        ticket_id=ticket_id,
+        actor=actor,
+    )
+
+    last_step_order = (
+        PlanStep.objects
+        .filter(ticket=ticket)
+        .order_by("-step_order")
+        .values_list("step_order", flat=True)
+        .first()
+        or 0
+    )
+
+    step = PlanStep(
+        ticket=ticket,
+        step_order=last_step_order + 1,
+        step_kind=step_kind,
+        name=name,
+        description=description,
+        planned_duration_min=planned_duration_min,
+    )
+
+    step.full_clean()
+    step.save()
+
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_UPDATED,
+        obj=ticket,
+        details={
+            "operation": "plan_step_added",
+            "plan_step_id": str(step.pk),
+            "step_order": step.step_order,
+            "step_kind": step.step_kind,
+            "name": step.name,
+        },
+    )
+
+    return step
+
+
+@transaction.atomic
+def update_plan_step(
+    *,
+    ticket_id,
+    step_id,
+    actor,
+    step_kind,
+    name,
+    planned_duration_min,
+    description="",
+):
+    """
+    Обновляет существующий плановый шаг.
+
+    Порядковый номер не меняется.
+    Для изменения порядка в MVP используется
+    удаление последних шагов и их повторное добавление.
+    """
+
+    ticket = _get_locked_draft_for_plan(
+        ticket_id=ticket_id,
+        actor=actor,
+    )
+
+    try:
+        step = (
+            PlanStep.objects
+            .select_for_update()
+            .get(
+                pk=step_id,
+                ticket=ticket,
+            )
+        )
+    except PlanStep.DoesNotExist:
+        raise ChangeWorkflowError(
+            "Плановый шаг не найден в этой карточке."
+        )
+
+    changed_fields = []
+
+    new_values = {
+        "step_kind": step_kind,
+        "name": name,
+        "description": description,
+        "planned_duration_min": planned_duration_min,
+    }
+
+    for field, value in new_values.items():
+        if getattr(step, field) != value:
+            setattr(step, field, value)
+            changed_fields.append(field)
+
+    if not changed_fields:
+        return step
+
+    step.full_clean()
+
+    step.save(
+        update_fields=[
+            *changed_fields,
+            "updated_at",
+        ]
+    )
+
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_UPDATED,
+        obj=ticket,
+        details={
+            "operation": "plan_step_updated",
+            "plan_step_id": str(step.pk),
+            "step_order": step.step_order,
+            "changed_fields": changed_fields,
+        },
+    )
+
+    return step
+
+
+@transaction.atomic
+def delete_plan_step(
+    *,
+    ticket_id,
+    step_id,
+    actor,
+):
+    """
+    Удаляет последний шаг плана черновика.
+
+    Удаление шагов из середины списка запрещено,
+    чтобы не нарушить последовательность нумерации.
+    """
+
+    ticket = _get_locked_draft_for_plan(
+        ticket_id=ticket_id,
+        actor=actor,
+    )
+
+    try:
+        step = (
+            PlanStep.objects
+            .select_for_update()
+            .get(
+                pk=step_id,
+                ticket=ticket,
+            )
+        )
+    except PlanStep.DoesNotExist:
+        raise ChangeWorkflowError(
+            "Плановый шаг не найден в этой карточке."
+        )
+
+    last_step_order = (
+        PlanStep.objects
+        .filter(ticket=ticket)
+        .order_by("-step_order")
+        .values_list("step_order", flat=True)
+        .first()
+    )
+
+    if step.step_order != last_step_order:
+        raise ChangeWorkflowError(
+            "Сначала необходимо удалить последующие шаги плана."
+        )
+
+    step_data = {
+        "plan_step_id": str(step.pk),
+        "step_order": step.step_order,
+        "step_kind": step.step_kind,
+        "name": step.name,
+    }
+
+    step.delete()
+
+    record_event(
+        actor=actor,
+        action=AuditAction.CHANGE_UPDATED,
+        obj=ticket,
+        details={
+            "operation": "plan_step_deleted",
+            **step_data,
         },
     )
 

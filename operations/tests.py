@@ -1,9 +1,20 @@
+
+import hashlib
+import tempfile
+
+from datetime import timedelta
+
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
+from access.models import ModuleRole, RoleAssignment
+from audit.models import AuditEvent
+from audit.services import AuditAction
+from backups.models import Backup, BackupIntegrityStatus
 from catalogs.models import (
     CardStatus,
     CardStatusCode,
@@ -11,8 +22,19 @@ from catalogs.models import (
     RollbackReason,
     SoftwareType,
 )
-
-from changes.models import PlanStep, StepKind, ChangeTicket
+from changes.models import (
+    ChangeTicket,
+    CompatibilityStatus,
+    HashStatus,
+    PlanStep,
+    ResourcesCheckStatus,
+    StepKind,
+)
+from deployments.models import (
+    DeploymentAdapterType,
+    DeploymentEnvironment,
+    DeploymentTarget,
+)
 
 from .models import (
     Operation,
@@ -22,52 +44,30 @@ from .models import (
     StepExecutionStatus,
     StepTemplate,
 )
-
-from django.core.exceptions import PermissionDenied
-
-from access.models import ModuleRole, RoleAssignment
-
-from audit.models import AuditEvent
-from audit.services import AuditAction
-
 from .services import (
     OperationServiceError,
-    start_step,
     complete_step,
     fail_step,
+    start_step,
     start_update_operation,
 )
 
-import hashlib
-import tempfile
-
-from datetime import timedelta
-
-from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
-
-from changes.models import (
-    CompatibilityStatus,
-    HashStatus,
-    ResourcesCheckStatus,
-)
-
-from backups.models import Backup, BackupIntegrityStatus
 
 User = get_user_model()
 
 
 class OperationsModelTests(TestCase):
+    """
+    Проверки моделей операций, шагов и шаблонов.
+    """
 
     def setUp(self):
-        # Пользователь для тестов.
         self.user = User.objects.create_user(
             username="executor_test",
             email="executor_test@example.test",
             password="test-password",
         )
 
-        # Тестовое программное обеспечение.
         self.software_type = SoftwareType.objects.create(
             name="Тестовая категория ПО",
         )
@@ -78,12 +78,10 @@ class OperationsModelTests(TestCase):
             current_version="1.0",
         )
 
-        # Используем системный статус карточки.
         self.approved_status = CardStatus.objects.get(
             code=CardStatusCode.APPROVED,
         )
 
-        # Причина отката.
         self.rollback_reason = RollbackReason.objects.create(
             name="Тестовая причина отката",
         )
@@ -192,7 +190,6 @@ class OperationsModelTests(TestCase):
             status=OperationStatus.FAILED,
         )
 
-        # Создаём резервную копию именно для другой операции UPDATE.
         other_backup = Backup.objects.create(
             operation=other_update,
             file="test-backups/other-backup.bin",
@@ -293,7 +290,10 @@ class OperationsModelTests(TestCase):
         execution.save()
 
         self.assertEqual(execution.plan_step_id, plan_step.pk)
-        self.assertEqual(execution.status, StepExecutionStatus.LOCKED)
+        self.assertEqual(
+            execution.status,
+            StepExecutionStatus.LOCKED,
+        )
 
     def test_execution_snapshot_cannot_be_changed(self):
         operation = self.create_update_operation()
@@ -362,10 +362,14 @@ class OperationsModelTests(TestCase):
                     name="Некорректный шаблон",
                     default_duration_min=10,
                 )
+
+
 class OperationServiceTests(TestCase):
+    """
+    Проверки сервиса выполнения шагов операции.
+    """
 
     def setUp(self):
-        # Исполнитель.
         self.executor = User.objects.create_user(
             username="service_executor",
             email="service_executor@example.test",
@@ -377,7 +381,6 @@ class OperationServiceTests(TestCase):
             role=ModuleRole.EXECUTOR,
         )
 
-        # Руководитель для проверки ограничений доступа.
         self.approver = User.objects.create_user(
             username="service_approver",
             email="service_approver@example.test",
@@ -389,7 +392,6 @@ class OperationServiceTests(TestCase):
             role=ModuleRole.APPROVER,
         )
 
-        # Программное обеспечение.
         self.software_type = SoftwareType.objects.create(
             name="Сервисная категория ПО",
         )
@@ -400,7 +402,6 @@ class OperationServiceTests(TestCase):
             current_version="1.0",
         )
 
-        # Карточка должна быть в работе.
         self.ticket = ChangeTicket.objects.create(
             software=self.software,
             created_by=self.executor,
@@ -411,7 +412,6 @@ class OperationServiceTests(TestCase):
             target_version="2.0",
         )
 
-        # Операция обновления.
         self.operation = Operation.objects.create(
             change_ticket=self.ticket,
             operation_type=OperationType.UPDATE,
@@ -420,7 +420,6 @@ class OperationServiceTests(TestCase):
             initiated_by=self.executor,
         )
 
-        # Плановые шаги.
         self.backup_plan = PlanStep.objects.create(
             ticket=self.ticket,
             step_order=1,
@@ -439,7 +438,6 @@ class OperationServiceTests(TestCase):
             planned_duration_min=20,
         )
 
-        # Фактические шаги.
         self.step1 = StepExecution.objects.create(
             operation=self.operation,
             plan_step=self.backup_plan,
@@ -479,6 +477,7 @@ class OperationServiceTests(TestCase):
 
         self.assertEqual(step.started_by, self.executor)
         self.assertIsNotNone(step.started_at)
+
         event = AuditEvent.objects.get(
             action=AuditAction.STEP_STARTED,
             object_id=self.step1.pk,
@@ -488,7 +487,7 @@ class OperationServiceTests(TestCase):
         self.assertEqual(
             event.object_type,
             "operations.stepexecution",
-)
+        )
 
     def test_locked_step_cannot_be_started(self):
         with self.assertRaises(OperationServiceError):
@@ -519,6 +518,7 @@ class OperationServiceTests(TestCase):
             actor=self.executor,
             result="Резервная копия создана",
         )
+
         self.assertTrue(
             AuditEvent.objects.filter(
                 action=AuditAction.STEP_COMPLETED,
@@ -534,10 +534,10 @@ class OperationServiceTests(TestCase):
         )
 
     def test_next_step_cannot_start_before_previous_completed(self):
-        # Искусственно открываем второй шаг,
-        # чтобы проверить именно серверное ограничение.
         self.step2.status = StepExecutionStatus.AVAILABLE
-        self.step2.save(update_fields=["status", "updated_at"])
+        self.step2.save(
+            update_fields=["status", "updated_at"]
+        )
 
         with self.assertRaises(OperationServiceError):
             start_step(
@@ -546,7 +546,6 @@ class OperationServiceTests(TestCase):
             )
 
     def test_two_steps_cannot_run_simultaneously(self):
-        # Первый шаг уже выполняется.
         self.step1.status = StepExecutionStatus.IN_PROGRESS
         self.step1.started_by = self.executor
         self.step1.started_at = timezone.now()
@@ -560,7 +559,6 @@ class OperationServiceTests(TestCase):
             ]
         )
 
-        # Попытка начать второй шаг.
         self.step2.status = StepExecutionStatus.AVAILABLE
         self.step2.save(
             update_fields=["status", "updated_at"]
@@ -577,7 +575,6 @@ class OperationServiceTests(TestCase):
     # --------------------------------------------------------
 
     def test_all_steps_complete_operation_and_ticket(self):
-        # Первый шаг.
         start_step(
             step_execution_id=self.step1.pk,
             actor=self.executor,
@@ -589,7 +586,6 @@ class OperationServiceTests(TestCase):
             result="Резервная копия создана",
         )
 
-        # Второй шаг.
         start_step(
             step_execution_id=self.step2.pk,
             actor=self.executor,
@@ -608,6 +604,7 @@ class OperationServiceTests(TestCase):
             self.operation.status,
             OperationStatus.COMPLETED,
         )
+
         self.assertEqual(
             AuditEvent.objects.filter(
                 action=AuditAction.STEP_COMPLETED,
@@ -675,7 +672,6 @@ class OperationServiceTests(TestCase):
 
         self.assertIsNotNone(self.operation.finished_at)
 
-        # Карточка остаётся в работе.
         self.assertEqual(
             self.ticket.status.code,
             CardStatusCode.IN_PROGRESS,
@@ -693,10 +689,14 @@ class OperationServiceTests(TestCase):
                 actor=self.executor,
                 error_message="   ",
             )
+
+
 class StartUpdateOperationTests(TestCase):
+    """
+    Проверки запуска операции обновления.
+    """
 
     def setUp(self):
-        # Временная папка для тестовых пакетов.
         self.temp_media = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_media.cleanup)
 
@@ -706,7 +706,6 @@ class StartUpdateOperationTests(TestCase):
         self.media_override.enable()
         self.addCleanup(self.media_override.disable)
 
-        # Исполнитель.
         self.executor = User.objects.create_user(
             username="start_executor",
             email="start_executor@example.test",
@@ -718,7 +717,6 @@ class StartUpdateOperationTests(TestCase):
             role=ModuleRole.EXECUTOR,
         )
 
-        # Руководитель, согласовавший карточку.
         self.approver = User.objects.create_user(
             username="start_approver",
             email="start_approver@example.test",
@@ -730,7 +728,6 @@ class StartUpdateOperationTests(TestCase):
             role=ModuleRole.APPROVER,
         )
 
-        # Программное обеспечение.
         self.software_type = SoftwareType.objects.create(
             name="Категория для запуска обновления",
         )
@@ -741,7 +738,16 @@ class StartUpdateOperationTests(TestCase):
             current_version="1.0",
         )
 
-        # Тестовый пакет и его контрольная сумма.
+        # Конкретная целевая установка для тестов запуска.
+        self.deployment_target = DeploymentTarget.objects.create(
+            software=self.software,
+            name="Тестовая установка обновления",
+            environment=DeploymentEnvironment.TEST,
+            adapter_type=DeploymentAdapterType.LOCAL_FILESYSTEM,
+            config_key="tests.update_target",
+            is_active=True,
+        )
+
         self.package_content = b"museum software update package"
 
         self.expected_hash = hashlib.sha256(
@@ -750,9 +756,9 @@ class StartUpdateOperationTests(TestCase):
 
         now = timezone.now()
 
-        # Согласованная карточка.
         self.ticket = ChangeTicket.objects.create(
             software=self.software,
+            deployment_target=self.deployment_target,
             created_by=self.executor,
             approved_by=self.approver,
             status=CardStatus.objects.get(
@@ -772,7 +778,6 @@ class StartUpdateOperationTests(TestCase):
             ),
         )
 
-        # Первый шаг обязательно резервное копирование.
         self.backup_step = PlanStep.objects.create(
             ticket=self.ticket,
             step_order=1,
@@ -782,7 +787,6 @@ class StartUpdateOperationTests(TestCase):
             planned_duration_min=10,
         )
 
-        # Второй шаг — обновление.
         self.update_step = PlanStep.objects.create(
             ticket=self.ticket,
             step_order=2,
@@ -797,7 +801,6 @@ class StartUpdateOperationTests(TestCase):
     # --------------------------------------------------------
 
     def test_successful_start_creates_operation(self):
-
         operation = start_update_operation(
             ticket_id=self.ticket.pk,
             actor=self.executor,
@@ -840,11 +843,68 @@ class StartUpdateOperationTests(TestCase):
         self.assertIsNotNone(self.ticket.hash_checked_at)
 
     # --------------------------------------------------------
+    # ПРОВЕРКА ЦЕЛЕВОЙ УСТАНОВКИ
+    # --------------------------------------------------------
+
+    def test_start_cannot_run_without_deployment_target(self):
+        self.ticket.deployment_target = None
+        self.ticket.save(update_fields=["deployment_target"])
+
+        with self.assertRaises(OperationServiceError):
+            start_update_operation(
+                ticket_id=self.ticket.pk,
+                actor=self.executor,
+            )
+
+        self.assertFalse(
+            Operation.objects.filter(
+                change_ticket=self.ticket,
+            ).exists()
+        )
+
+    def test_start_cannot_run_with_inactive_deployment_target(self):
+        DeploymentTarget.objects.filter(
+            pk=self.deployment_target.pk,
+        ).update(is_active=False)
+
+        with self.assertRaises(OperationServiceError):
+            start_update_operation(
+                ticket_id=self.ticket.pk,
+                actor=self.executor,
+            )
+
+        self.assertFalse(
+            Operation.objects.filter(
+                change_ticket=self.ticket,
+            ).exists()
+        )
+
+    def test_start_cannot_run_with_unconfigured_deployment_target(self):
+        DeploymentTarget.objects.filter(
+            pk=self.deployment_target.pk,
+        ).update(
+            adapter_type=DeploymentAdapterType.UNCONFIGURED,
+            config_key="",
+            is_active=False,
+        )
+
+        with self.assertRaises(OperationServiceError):
+            start_update_operation(
+                ticket_id=self.ticket.pk,
+                actor=self.executor,
+            )
+
+        self.assertFalse(
+            Operation.objects.filter(
+                change_ticket=self.ticket,
+            ).exists()
+        )
+
+    # --------------------------------------------------------
     # СОЗДАНИЕ СНИМКОВ ПЛАНА
     # --------------------------------------------------------
 
     def test_start_creates_snapshots_of_all_plan_steps(self):
-
         operation = start_update_operation(
             ticket_id=self.ticket.pk,
             actor=self.executor,
@@ -877,7 +937,6 @@ class StartUpdateOperationTests(TestCase):
         )
 
     def test_snapshot_does_not_change_when_plan_is_edited(self):
-
         operation = start_update_operation(
             ticket_id=self.ticket.pk,
             actor=self.executor,
@@ -888,11 +947,14 @@ class StartUpdateOperationTests(TestCase):
         original_name = execution.name
 
         self.update_step.name = "Новое название планового шага"
-        self.update_step.save(update_fields=["name", "updated_at"])
+        self.update_step.save(
+            update_fields=["name", "updated_at"]
+        )
 
         execution.refresh_from_db()
 
         self.assertEqual(execution.name, original_name)
+
         self.assertNotEqual(
             execution.name,
             self.update_step.name,
@@ -903,7 +965,6 @@ class StartUpdateOperationTests(TestCase):
     # --------------------------------------------------------
 
     def test_hash_mismatch_does_not_create_operation(self):
-
         self.ticket.expected_sha256 = "0" * 64
         self.ticket.save(update_fields=["expected_sha256"])
 
@@ -932,7 +993,7 @@ class StartUpdateOperationTests(TestCase):
 
         self.assertEqual(
             Operation.objects.filter(
-                change_ticket=self.ticket
+                change_ticket=self.ticket,
             ).count(),
             0,
         )
@@ -942,7 +1003,6 @@ class StartUpdateOperationTests(TestCase):
     # --------------------------------------------------------
 
     def test_operation_cannot_start_without_approval(self):
-
         self.ticket.approved_by = None
         self.ticket.save(update_fields=["approved_by"])
 
@@ -954,12 +1014,11 @@ class StartUpdateOperationTests(TestCase):
 
         self.assertFalse(
             Operation.objects.filter(
-                change_ticket=self.ticket
+                change_ticket=self.ticket,
             ).exists()
         )
 
     def test_operation_cannot_start_outside_approved_window(self):
-
         now = timezone.now()
 
         self.ticket.window_start_at = now - timedelta(hours=2)
@@ -980,7 +1039,7 @@ class StartUpdateOperationTests(TestCase):
 
         self.assertFalse(
             Operation.objects.filter(
-                change_ticket=self.ticket
+                change_ticket=self.ticket,
             ).exists()
         )
 
@@ -989,7 +1048,6 @@ class StartUpdateOperationTests(TestCase):
     # --------------------------------------------------------
 
     def test_another_executor_cannot_start_ticket(self):
-
         another_executor = User.objects.create_user(
             username="another_executor",
             email="another_executor@example.test",
@@ -1009,7 +1067,7 @@ class StartUpdateOperationTests(TestCase):
 
         self.assertFalse(
             Operation.objects.filter(
-                change_ticket=self.ticket
+                change_ticket=self.ticket,
             ).exists()
         )
 
@@ -1018,7 +1076,6 @@ class StartUpdateOperationTests(TestCase):
     # --------------------------------------------------------
 
     def test_failed_update_can_be_retried(self):
-
         self.ticket.status = CardStatus.objects.get(
             code=CardStatusCode.IN_PROGRESS,
         )
@@ -1048,7 +1105,11 @@ class StartUpdateOperationTests(TestCase):
 
         self.assertEqual(operation.sequence_number, 2)
         self.assertEqual(operation.attempt_number, 2)
-        self.assertEqual(operation.status, OperationStatus.RUNNING)
+        self.assertEqual(
+            operation.status,
+            OperationStatus.RUNNING,
+        )
+
         self.assertTrue(
             AuditEvent.objects.filter(
                 action=AuditAction.UPDATE_STARTED,

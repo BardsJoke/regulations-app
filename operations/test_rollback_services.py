@@ -18,6 +18,11 @@ from catalogs.models import (
     SoftwareType,
 )
 from changes.models import ChangeTicket, StepKind
+from deployments.models import (
+    DeploymentAdapterType,
+    DeploymentEnvironment,
+    DeploymentTarget,
+)
 
 from .models import (
     Operation,
@@ -45,6 +50,7 @@ class StartRollbackOperationTests(TestCase):
     Проверяются:
     - права доступа;
     - исходная операция обновления;
+    - целевая установка;
     - резервная копия;
     - причина отката;
     - шаблоны шагов;
@@ -109,6 +115,19 @@ class StartRollbackOperationTests(TestCase):
         )
 
         # ----------------------------------------------------
+        # ЦЕЛЕВАЯ УСТАНОВКА
+        # ----------------------------------------------------
+
+        self.deployment_target = DeploymentTarget.objects.create(
+            software=self.software,
+            name="Тестовая установка отката",
+            environment=DeploymentEnvironment.TEST,
+            adapter_type=DeploymentAdapterType.LOCAL_FILESYSTEM,
+            config_key="tests.rollback_target",
+            is_active=True,
+        )
+
+        # ----------------------------------------------------
         # КАРТОЧКА ИСХОДНОГО ИЗМЕНЕНИЯ
         # ----------------------------------------------------
 
@@ -133,9 +152,7 @@ class StartRollbackOperationTests(TestCase):
         # СОДЕРЖИМОЕ РЕЗЕРВНОЙ КОПИИ
         # ----------------------------------------------------
 
-        self.backup_content = (
-            b"test museum system backup content"
-        )
+        self.backup_content = b"test museum system backup content"
 
         self.backup = self.create_backup()
 
@@ -170,6 +187,7 @@ class StartRollbackOperationTests(TestCase):
     def create_ticket(self, status_code=CardStatusCode.IN_PROGRESS):
         return ChangeTicket.objects.create(
             software=self.software,
+            deployment_target=self.deployment_target,
             created_by=self.executor,
             status=CardStatus.objects.get(code=status_code),
             source_version="1.0",
@@ -300,7 +318,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_successful_start_creates_rollback_operation(self):
-
         operation = self.start_rollback()
 
         self.assertEqual(
@@ -337,12 +354,62 @@ class StartRollbackOperationTests(TestCase):
         self.assertEqual(operation.attempt_number, 1)
 
     # ========================================================
+    # ПРОВЕРКА ЦЕЛЕВОЙ УСТАНОВКИ
+    # ========================================================
+
+    def test_rollback_cannot_start_without_deployment_target(self):
+        self.ticket.deployment_target = None
+        self.ticket.save(
+            update_fields=["deployment_target"]
+        )
+
+        with self.assertRaises(OperationServiceError):
+            self.start_rollback()
+
+        self.assertFalse(
+            Operation.objects.filter(
+                operation_type=OperationType.ROLLBACK,
+            ).exists()
+        )
+
+    def test_rollback_cannot_start_with_inactive_deployment_target(self):
+        DeploymentTarget.objects.filter(
+            pk=self.deployment_target.pk,
+        ).update(is_active=False)
+
+        with self.assertRaises(OperationServiceError):
+            self.start_rollback()
+
+        self.assertFalse(
+            Operation.objects.filter(
+                operation_type=OperationType.ROLLBACK,
+            ).exists()
+        )
+
+    def test_rollback_cannot_start_with_unconfigured_deployment_target(self):
+        DeploymentTarget.objects.filter(
+            pk=self.deployment_target.pk,
+        ).update(
+            adapter_type=DeploymentAdapterType.UNCONFIGURED,
+            config_key="",
+            is_active=False,
+        )
+
+        with self.assertRaises(OperationServiceError):
+            self.start_rollback()
+
+        self.assertFalse(
+            Operation.objects.filter(
+                operation_type=OperationType.ROLLBACK,
+            ).exists()
+        )
+
+    # ========================================================
     # СОЗДАНИЕ СОБСТВЕННЫХ ШАГОВ ОТКАТА
     # ========================================================
 
     def test_start_creates_snapshots_from_rollback_templates(self):
-
-        # Дополнительный шаблон UPDATE не должен использоваться.
+        # Шаблон UPDATE не должен использоваться.
         StepTemplate.objects.create(
             operation_type=OperationType.UPDATE,
             step_kind=StepKind.OTHER,
@@ -379,15 +446,8 @@ class StartRollbackOperationTests(TestCase):
             self.verify_template.name,
         )
 
-        self.assertEqual(
-            executions[0].step_order,
-            1,
-        )
-
-        self.assertEqual(
-            executions[1].step_order,
-            2,
-        )
+        self.assertEqual(executions[0].step_order, 1)
+        self.assertEqual(executions[1].step_order, 2)
 
         self.assertIsNone(executions[0].plan_step_id)
         self.assertIsNone(executions[1].plan_step_id)
@@ -412,7 +472,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_backup_is_reverified_before_rollback(self):
-
         backup = self.create_backup(
             integrity_status=BackupIntegrityStatus.NOT_CHECKED,
         )
@@ -437,11 +496,8 @@ class StartRollbackOperationTests(TestCase):
         )
 
     def test_corrupted_backup_is_rejected_and_invalid_status_is_saved(self):
-
-        # Повреждаем файл после создания записи.
-        corrupted_content = (
-            b"X" + self.backup_content[1:]
-        )
+        # Повреждаем физический файл после создания записи.
+        corrupted_content = b"X" + self.backup_content[1:]
 
         with open(self.backup.file.path, "wb") as stored_file:
             stored_file.write(corrupted_content)
@@ -472,7 +528,6 @@ class StartRollbackOperationTests(TestCase):
         )
 
     def test_missing_backup_file_is_rejected_and_error_status_is_saved(self):
-
         self.backup.file.storage.delete(
             self.backup.file.name
         )
@@ -501,7 +556,6 @@ class StartRollbackOperationTests(TestCase):
         )
 
     def test_backup_from_another_operation_cannot_be_used(self):
-
         other_ticket = self.create_ticket()
 
         other_update = self.create_update_operation(
@@ -531,7 +585,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_rollback_cannot_be_started_from_running_update(self):
-
         self.parent_operation.status = OperationStatus.RUNNING
         self.parent_operation.finished_at = None
 
@@ -547,7 +600,6 @@ class StartRollbackOperationTests(TestCase):
             self.start_rollback()
 
     def test_rollback_cannot_reference_another_rollback(self):
-
         previous_rollback = self.create_previous_rollback()
 
         with self.assertRaises(OperationServiceError):
@@ -556,7 +608,6 @@ class StartRollbackOperationTests(TestCase):
             )
 
     def test_only_latest_update_can_be_rolled_back(self):
-
         self.create_update_operation(
             sequence_number=2,
             attempt_number=2,
@@ -577,7 +628,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_inactive_rollback_reason_cannot_be_used(self):
-
         self.rollback_reason.is_active = False
 
         self.rollback_reason.save(
@@ -598,7 +648,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_approver_cannot_start_rollback(self):
-
         with self.assertRaises(PermissionDenied):
             self.start_rollback(
                 actor=self.approver,
@@ -611,7 +660,6 @@ class StartRollbackOperationTests(TestCase):
         )
 
     def test_another_executor_cannot_start_rollback(self):
-
         another_executor = User.objects.create_user(
             username="another_rollback_executor",
             email="another_rollback_executor@example.test",
@@ -639,7 +687,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_rollback_cannot_start_without_active_templates(self):
-
         StepTemplate.objects.filter(
             operation_type=OperationType.ROLLBACK,
         ).update(is_active=False)
@@ -658,7 +705,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_rollback_cannot_start_while_another_operation_is_running(self):
-
         self.create_previous_rollback(
             status=OperationStatus.RUNNING,
         )
@@ -667,7 +713,6 @@ class StartRollbackOperationTests(TestCase):
             self.start_rollback()
 
     def test_successfully_completed_rollback_cannot_be_repeated(self):
-
         self.create_previous_rollback(
             status=OperationStatus.COMPLETED,
         )
@@ -676,7 +721,6 @@ class StartRollbackOperationTests(TestCase):
             self.start_rollback()
 
     def test_failed_rollback_can_be_retried_with_new_numbers(self):
-
         self.create_previous_rollback(
             status=OperationStatus.FAILED,
             sequence_number=2,
@@ -685,15 +729,8 @@ class StartRollbackOperationTests(TestCase):
 
         operation = self.start_rollback()
 
-        self.assertEqual(
-            operation.sequence_number,
-            3,
-        )
-
-        self.assertEqual(
-            operation.attempt_number,
-            2,
-        )
+        self.assertEqual(operation.sequence_number, 3)
+        self.assertEqual(operation.attempt_number, 2)
 
         self.assertEqual(
             operation.status,
@@ -705,7 +742,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_rollback_of_completed_update_returns_ticket_to_progress(self):
-
         self.parent_operation.status = OperationStatus.COMPLETED
         self.parent_operation.finished_at = timezone.now()
 
@@ -739,7 +775,6 @@ class StartRollbackOperationTests(TestCase):
     # ========================================================
 
     def test_completing_all_rollback_steps_marks_ticket_as_rolled_back(self):
-
         operation = self.start_rollback()
 
         steps = list(
@@ -750,7 +785,6 @@ class StartRollbackOperationTests(TestCase):
 
         # Выполняем шаги последовательно.
         for step in steps:
-
             started_step = start_step(
                 step_execution_id=step.pk,
                 actor=self.executor,
@@ -783,8 +817,9 @@ class StartRollbackOperationTests(TestCase):
             CardStatusCode.ROLLED_BACK,
         )
 
-        self.assertTrue(
+        self.assertEqual(
             operation.steps.filter(
                 status=StepExecutionStatus.COMPLETED,
-            ).count() == 2
+            ).count(),
+            2,
         )
