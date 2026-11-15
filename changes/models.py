@@ -1,4 +1,3 @@
-
 import uuid
 
 from django.conf import settings
@@ -54,19 +53,6 @@ class ChangeTicket(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="change_tickets",
         verbose_name="Программное обеспечение",
-    )
-
-    deployment_target = models.ForeignKey(
-        "deployments.DeploymentTarget",
-        on_delete=models.PROTECT,
-        related_name="change_tickets",
-        null=True,
-        blank=True,
-        verbose_name="Целевая установка",
-        help_text=(
-            "Конкретная установка программного обеспечения, "
-            "для которой планируется изменение."
-        ),
     )
 
     created_by = models.ForeignKey(
@@ -211,26 +197,12 @@ class ChangeTicket(TimeStampedModel):
                 )
             })
 
-        if (
-            self.deployment_target_id
-            and self.software_id
-            and self.deployment_target.software_id != self.software_id
-        ):
-            raise ValidationError({
-                "deployment_target": (
-                    "Целевая установка должна относиться "
-                    "к выбранному программному обеспечению."
-                )
-            })
-
     def __str__(self):
         return (
             f"{self.software.name}: "
             f"{self.source_version or '—'} → "
             f"{self.target_version or '—'}"
         )
-
-
 class ApprovalDecision(models.TextChoices):
     APPROVED = "approved", "Согласовано"
     REJECTED = "rejected", "Отклонено"
@@ -258,6 +230,30 @@ class ApprovalRecord(models.Model):
         on_delete=models.PROTECT,
         related_name="approval_records",
         verbose_name="Карточка изменения",
+        deployment_target = models.ForeignKey(
+            "deployments.DeploymentTarget",
+            on_delete=models.PROTECT,
+            related_name="change_tickets",
+            null=True,
+            blank=True,
+            verbose_name="Целевая установка",
+            help_text=(
+                "Конкретная установка программного обеспечения, "
+                "для которой планируется изменение."
+            ),
+        software_package = models.ForeignKey(
+            "catalogs.SoftwarePackage",
+            on_delete=models.PROTECT,
+            related_name="change_tickets",
+            null=True,
+            blank=True,
+            verbose_name="Пакет обновления",
+            help_text=(
+                "Проверенный пакет из библиотеки программного обеспечения. "
+                "Для исторических карточек может отсутствовать."
+            ),
+        )
+        )
     )
 
     approver = models.ForeignKey(
@@ -317,8 +313,6 @@ class ApprovalRecord(models.Model):
             f"{self.ticket} — "
             f"{self.get_decision_display()}"
         )
-
-
 class StepKind(models.TextChoices):
     BACKUP = "backup", "Резервное копирование"
     UPDATE = "update", "Обновление"
@@ -405,8 +399,6 @@ class PlanStep(TimeStampedModel):
 
     def __str__(self):
         return f"{self.step_order}. {self.name}"
-
-
 class AttachmentKind(models.TextChoices):
     DOCUMENT = "document", "Документ"
     SCREENSHOT = "screenshot", "Скриншот"

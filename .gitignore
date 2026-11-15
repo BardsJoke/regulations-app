@@ -5,3 +5,5 @@ __pycache__/
 # Бдешки
 *.sqlite3
 *.sqlite3-*
+sqlite_before_postgresql.json
+postgresql_users_roles_profiles.json

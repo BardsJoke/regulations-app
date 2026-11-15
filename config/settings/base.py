@@ -12,9 +12,14 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 from pathlib import Path
+import environ
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 BASE_DIR = PROJECT_DIR.parent
+
+# Environment variables
+env = environ.Env()
+environ.Env.read_env(BASE_DIR / ".env")
 
 
 # Quick-start development settings - unsuitable for production
@@ -47,6 +52,7 @@ INSTALLED_APPS = [
     "wagtail",
     "modelcluster",
     "taggit",
+    "django.contrib.postgres",
     "django_filters",
     "django.contrib.admin",
     "django.contrib.auth",
@@ -93,12 +99,33 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+DB_ENGINE = env("DB_ENGINE", default="sqlite")
+
+if DB_ENGINE == "postgresql":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": env("DB_NAME"),
+            "USER": env("DB_USER"),
+            "PASSWORD": env("DB_PASSWORD"),
+            "HOST": env("DB_HOST", default="127.0.0.1"),
+            "PORT": env("DB_PORT", default="5432"),
+            "CONN_MAX_AGE": 60,
+        }
     }
-}
+
+elif DB_ENGINE == "sqlite":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
+
+else:
+    raise ValueError(
+        f"Unsupported DB_ENGINE: {DB_ENGINE}"
+    )
 
 
 # Password validation
@@ -192,3 +219,26 @@ WAGTAILDOCS_EXTENSIONS = ['csv', 'docx', 'key', 'odt', 'pdf', 'pptx', 'rtf', 'tx
 WAGTAILDOCS_MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB
 # Используем модель User из accounts для аутентификации
 AUTH_USER_MODEL = "accounts.User"
+
+# ==========================================
+# Настройки локальной песочницы развёртывания
+# ==========================================
+
+DEPLOYMENT_SANDBOX_ROOT = BASE_DIR / "var" / "deployment_sandbox"
+
+DEPLOYMENT_TARGETS = {
+    "tests.update_target": {
+        "root": DEPLOYMENT_SANDBOX_ROOT / "museum_demo" / "update_target",
+    },
+    "tests.rollback_target": {
+        "root": DEPLOYMENT_SANDBOX_ROOT / "museum_demo" / "rollback_target",
+    },
+}
+
+DEPLOYMENT_ARCHIVE_LIMITS = {
+    "max_entries": 5000,
+    "max_total_size": 1024 * 1024 * 1024,
+    "max_file_size": 256 * 1024 * 1024,
+    "max_compression_ratio": 200,
+    "max_manifest_size": 65536,
+}
