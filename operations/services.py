@@ -1,4 +1,3 @@
-
 import hashlib
 
 from django.core.exceptions import PermissionDenied, ValidationError
@@ -592,7 +591,9 @@ def start_update_operation(ticket_id, actor):
                 .select_related(
                     "software",
                     "status",
-                    "deployment_target",
+                    # deployment_target намеренно не включён сюда:
+                    # это nullable FK, а целевая установка отдельно
+                    # блокируется в _lock_and_validate_deployment_target().
                 )
                 .get(pk=ticket_id)
             )
@@ -891,7 +892,9 @@ def start_rollback_operation(
             .select_related(
                 "software",
                 "status",
-                "deployment_target",
+                # deployment_target намеренно не включён сюда:
+                # это nullable FK, а целевая установка отдельно
+                # блокируется в _lock_and_validate_deployment_target().
             )
             .get(pk=parent_operation.change_ticket_id)
         )

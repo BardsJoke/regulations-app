@@ -55,6 +55,32 @@ class ChangeTicket(TimeStampedModel):
         verbose_name="Программное обеспечение",
     )
 
+    deployment_target = models.ForeignKey(
+        "deployments.DeploymentTarget",
+        on_delete=models.PROTECT,
+        related_name="change_tickets",
+        null=True,
+        blank=True,
+        verbose_name="Целевая установка",
+        help_text=(
+            "Конкретная установка программного обеспечения, "
+            "для которой планируется изменение."
+        ),
+    )
+
+    software_package = models.ForeignKey(
+        "catalogs.SoftwarePackage",
+        on_delete=models.PROTECT,
+        related_name="change_tickets",
+        null=True,
+        blank=True,
+        verbose_name="Пакет обновления",
+        help_text=(
+            "Проверенный пакет из библиотеки программного обеспечения. "
+            "Для исторических карточек может отсутствовать."
+        ),
+    )
+
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
@@ -97,6 +123,7 @@ class ChangeTicket(TimeStampedModel):
 
     package_file = models.FileField(
         upload_to="change-packages/%Y/%m/",
+        max_length=180,
         blank=True,
         verbose_name="Пакет обновления",
     )
@@ -197,12 +224,69 @@ class ChangeTicket(TimeStampedModel):
                 )
             })
 
+        if self.deployment_target_id and self.software_id:
+            if self.deployment_target.software_id != self.software_id:
+                raise ValidationError({
+                    "deployment_target": (
+                        "Целевая установка должна относиться "
+                        "к выбранному программному обеспечению."
+                    )
+                })
+
+        if self.software_package_id:
+            package = self.software_package
+
+            if package.software_id != self.software_id:
+                raise ValidationError({
+                    "software_package": (
+                        "Пакет должен относиться к выбранному "
+                        "программному обеспечению."
+                    )
+                })
+
+            if package.status != "valid" or not package.is_usable:
+                raise ValidationError({
+                    "software_package": (
+                        "Можно выбирать только проверенные "
+                        "и доступные пакеты."
+                    )
+                })
+
+            if self.target_version != package.version:
+                raise ValidationError({
+                    "target_version": (
+                        "Целевая версия должна совпадать "
+                        "с версией выбранного пакета."
+                    )
+                })
+
+            if (
+                (self.expected_sha256 or "").lower()
+                != (package.sha256 or "").lower()
+            ):
+                raise ValidationError({
+                    "expected_sha256": (
+                        "Ожидаемая SHA-256 должна совпадать "
+                        "с контрольной суммой пакета."
+                    )
+                })
+
+            if self.package_file.name != package.package_file.name:
+                raise ValidationError({
+                    "package_file": (
+                        "Файл карточки должен ссылаться "
+                        "на файл выбранного пакета."
+                    )
+                })
+
     def __str__(self):
         return (
             f"{self.software.name}: "
             f"{self.source_version or '—'} → "
             f"{self.target_version or '—'}"
         )
+
+
 class ApprovalDecision(models.TextChoices):
     APPROVED = "approved", "Согласовано"
     REJECTED = "rejected", "Отклонено"
@@ -230,30 +314,6 @@ class ApprovalRecord(models.Model):
         on_delete=models.PROTECT,
         related_name="approval_records",
         verbose_name="Карточка изменения",
-        deployment_target = models.ForeignKey(
-            "deployments.DeploymentTarget",
-            on_delete=models.PROTECT,
-            related_name="change_tickets",
-            null=True,
-            blank=True,
-            verbose_name="Целевая установка",
-            help_text=(
-                "Конкретная установка программного обеспечения, "
-                "для которой планируется изменение."
-            ),
-        software_package = models.ForeignKey(
-            "catalogs.SoftwarePackage",
-            on_delete=models.PROTECT,
-            related_name="change_tickets",
-            null=True,
-            blank=True,
-            verbose_name="Пакет обновления",
-            help_text=(
-                "Проверенный пакет из библиотеки программного обеспечения. "
-                "Для исторических карточек может отсутствовать."
-            ),
-        )
-        )
     )
 
     approver = models.ForeignKey(
@@ -313,6 +373,8 @@ class ApprovalRecord(models.Model):
             f"{self.ticket} — "
             f"{self.get_decision_display()}"
         )
+
+
 class StepKind(models.TextChoices):
     BACKUP = "backup", "Резервное копирование"
     UPDATE = "update", "Обновление"
@@ -399,6 +461,8 @@ class PlanStep(TimeStampedModel):
 
     def __str__(self):
         return f"{self.step_order}. {self.name}"
+
+
 class AttachmentKind(models.TextChoices):
     DOCUMENT = "document", "Документ"
     SCREENSHOT = "screenshot", "Скриншот"

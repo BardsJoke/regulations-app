@@ -4,13 +4,19 @@ from django.db import transaction
 
 from access.models import ModuleRole, RoleAssignment
 from audit.services import AuditAction, record_event
-from catalogs.models import CardStatus, CardStatusCode
+from catalogs.models import (
+    CardStatus,
+    CardStatusCode,
+    SoftwarePackage,
+    SoftwarePackageStatus,
+)
 from deployments.models import DeploymentTarget
 
 from .models import (
     ApprovalDecision,
     ApprovalRecord,
     ChangeTicket,
+    HashStatus,
     PlanStep,
     StepKind,
 )
@@ -18,7 +24,9 @@ from .models import (
 
 class ChangeWorkflowError(ValidationError):
     """Ошибка нарушения правил бизнес-процесса."""
-    pass
+
+
+_UNSET = object()
 
 
 def _require_role(user, role):
@@ -77,12 +85,18 @@ def _get_locked_ticket(ticket_id):
     try:
         return (
             ChangeTicket.objects
-            .select_for_update()
+            # deployment_target и software_package — nullable FK.
+            # На PostgreSQL нельзя блокировать nullable-side LEFT JOIN;
+            # блокируем только строку карточки. Целевая установка и пакет
+            # блокируются отдельно в соответствующих helper-функциях.
+            .select_for_update(of=("self",))
             .select_related(
                 "status",
                 "software",
                 "deployment_target",
                 "deployment_target__software",
+                "software_package",
+                "software_package__software",
             )
             .get(pk=ticket_id)
         )
@@ -117,6 +131,91 @@ def _get_locked_deployment_target(target_or_id):
         raise ChangeWorkflowError(
             "Выбранная целевая установка не найдена."
         )
+
+
+def _get_locked_software_package(package_or_id, *, software_id):
+    """Получает и проверяет доступный пакет из библиотеки релизов."""
+
+    package_id = getattr(package_or_id, "pk", package_or_id)
+
+    if not package_id:
+        raise ChangeWorkflowError(
+            "Необходимо выбрать пакет обновления."
+        )
+
+    try:
+        package = (
+            SoftwarePackage.objects
+            .select_for_update()
+            .select_related("software")
+            .get(pk=package_id)
+        )
+    except SoftwarePackage.DoesNotExist:
+        raise ChangeWorkflowError(
+            "Выбранный пакет не найден в библиотеке."
+        )
+
+    if package.software_id != software_id:
+        raise ChangeWorkflowError(
+            "Выбранный пакет относится к другому программному обеспечению."
+        )
+
+    if (
+        package.status != SoftwarePackageStatus.VALID
+        or not package.is_usable
+    ):
+        raise ChangeWorkflowError(
+            "Пакет не прошёл проверку или недоступен."
+        )
+
+    try:
+        file_exists = bool(
+            package.package_file
+            and package.package_file.storage.exists(
+                package.package_file.name
+            )
+        )
+    except Exception as exc:
+        raise ChangeWorkflowError(
+            "Не удалось проверить наличие ZIP-файла пакета."
+        ) from exc
+
+    if not file_exists:
+        raise ChangeWorkflowError(
+            "Файл выбранного пакета отсутствует в хранилище."
+        )
+
+    return package
+
+
+def _validate_ticket_software_package(ticket):
+    """Повторно проверяет пакет карточки перед согласованием."""
+
+    if not ticket.software_package_id:
+        # Исторические карточки могут использовать прежний package_file.
+        return None
+
+    package = _get_locked_software_package(
+        ticket.software_package_id,
+        software_id=ticket.software_id,
+    )
+
+    if ticket.target_version != package.version:
+        raise ChangeWorkflowError(
+            "Целевая версия карточки не совпадает с версией пакета."
+        )
+
+    if (ticket.expected_sha256 or "").lower() != package.sha256.lower():
+        raise ChangeWorkflowError(
+            "Ожидаемая SHA-256 карточки не совпадает с пакетом."
+        )
+
+    if ticket.package_file.name != package.package_file.name:
+        raise ChangeWorkflowError(
+            "Файл карточки не совпадает с файлом выбранного пакета."
+        )
+
+    return package
 
 
 def _require_usable_deployment_target(target):
@@ -166,6 +265,7 @@ def _validate_ticket_target(ticket):
         )
 
     _require_usable_deployment_target(target)
+    _validate_ticket_software_package(ticket)
 
     return target
 
@@ -198,12 +298,18 @@ def create_draft(
     risks="",
     window_start_at=None,
     window_end_at=None,
+    software_package=None,
 ):
     """
     Создаёт новую карточку в статусе draft.
 
     Программное обеспечение определяется через выбранную
-    целевую установку.
+    целевую установку. Если передан software_package,
+    версия, SHA-256 и путь ZIP берутся из библиотеки релизов.
+
+    Параметр software_package пока необязателен для сохранения
+    совместимости со старыми вызывающими функциями. Новый UI
+    должен требовать выбор пакета для новых заявок.
     """
 
     _require_role(actor, ModuleRole.EXECUTOR)
@@ -212,12 +318,21 @@ def create_draft(
     _require_usable_deployment_target(target)
 
     software = target.software
+    package = None
+
+    if software_package is not None:
+        package = _get_locked_software_package(
+            software_package,
+            software_id=software.pk,
+        )
+        target_version = package.version
 
     draft_status = _get_status(CardStatusCode.DRAFT)
 
     ticket = ChangeTicket(
         software=software,
         deployment_target=target,
+        software_package=package,
         created_by=actor,
         status=draft_status,
         source_version=source_version,
@@ -226,6 +341,11 @@ def create_draft(
         window_start_at=window_start_at,
         window_end_at=window_end_at,
     )
+
+    if package is not None:
+        # Ссылаемся на тот же объект в storage, не копируя ZIP.
+        ticket.package_file = package.package_file.name
+        ticket.expected_sha256 = package.sha256.lower()
 
     ticket.full_clean()
     ticket.save()
@@ -237,6 +357,10 @@ def create_draft(
         details={
             "software_id": str(ticket.software_id),
             "deployment_target_id": str(target.pk),
+            "software_package_id": (
+                str(package.pk) if package else None
+            ),
+            "package_version": package.version if package else None,
             "environment": target.environment,
             "adapter_type": target.adapter_type,
             "status": ticket.status.code,
@@ -610,6 +734,7 @@ def update_draft(
     risks="",
     window_start_at=None,
     window_end_at=None,
+    software_package=_UNSET,
 ):
     """
     Обновляет существующий черновик.
@@ -617,8 +742,9 @@ def update_draft(
     Исполнитель может редактировать только собственные
     карточки, пока они находятся в статусе draft.
 
-    Программное обеспечение автоматически определяется
-    по выбранной целевой установке.
+    Если software_package не передан, существующая связь
+    сохраняется, когда пакет подходит новому software.
+    Явная передача None снимает связь с пакетом.
     """
 
     _require_role(actor, ModuleRole.EXECUTOR)
@@ -634,8 +760,31 @@ def update_draft(
 
     target = _get_locked_deployment_target(deployment_target)
     _require_usable_deployment_target(target)
-
     software = target.software
+
+    selected_package = None
+    clear_existing_package = False
+
+    if software_package is _UNSET:
+        if ticket.software_package_id:
+            if ticket.software_package.software_id == software.pk:
+                selected_package = _get_locked_software_package(
+                    ticket.software_package_id,
+                    software_id=software.pk,
+                )
+            else:
+                clear_existing_package = True
+    elif software_package is None:
+        clear_existing_package = bool(ticket.software_package_id)
+    else:
+        selected_package = _get_locked_software_package(
+            software_package,
+            software_id=software.pk,
+        )
+
+    # Для выбранного/сохраняемого пакета версия берётся из библиотеки.
+    if selected_package is not None:
+        target_version = selected_package.version
 
     changed_fields = []
 
@@ -660,6 +809,8 @@ def update_draft(
     if ticket.window_end_at != window_end_at:
         changed_fields.append("window_end_at")
 
+    old_package = ticket.software_package if ticket.software_package_id else None
+
     ticket.software = software
     ticket.deployment_target = target
     ticket.source_version = source_version
@@ -668,32 +819,111 @@ def update_draft(
     ticket.window_start_at = window_start_at
     ticket.window_end_at = window_end_at
 
+    if selected_package is not None:
+        package_selection_changed = (
+            ticket.software_package_id != selected_package.pk
+        )
+        package_file_changed = (
+            ticket.package_file.name != selected_package.package_file.name
+        )
+        package_checksum_changed = (
+            (ticket.expected_sha256 or "").lower()
+            != selected_package.sha256.lower()
+        )
+
+        if package_selection_changed:
+            changed_fields.append("software_package")
+        if package_file_changed:
+            changed_fields.append("package_file")
+        if package_checksum_changed:
+            changed_fields.append("expected_sha256")
+
+        ticket.software_package = selected_package
+        ticket.target_version = selected_package.version
+        ticket.package_file = selected_package.package_file.name
+        ticket.expected_sha256 = selected_package.sha256.lower()
+
+        # Сбрасываем результат проверки только при фактической смене
+        # выбранного пакета, файла или контрольной суммы.
+        if (
+            package_selection_changed
+            or package_file_changed
+            or package_checksum_changed
+        ):
+            ticket.actual_sha256 = ""
+            ticket.hash_status = HashStatus.NOT_CHECKED
+            ticket.hash_checked_at = None
+
+            changed_fields.extend([
+                "actual_sha256",
+                "hash_status",
+                "hash_checked_at",
+            ])
+    elif clear_existing_package:
+        if ticket.software_package_id:
+            changed_fields.append("software_package")
+
+        # Если старый файл был именно файлом библиотеки пакетов,
+        # очищаем ссылку на него при отвязке/смене продукта.
+        if (
+            old_package is not None
+            and ticket.package_file.name == old_package.package_file.name
+        ):
+            ticket.package_file = ""
+            ticket.expected_sha256 = ""
+            ticket.actual_sha256 = ""
+            ticket.hash_status = HashStatus.NOT_CHECKED
+            ticket.hash_checked_at = None
+
+            changed_fields.extend([
+                "package_file",
+                "expected_sha256",
+                "actual_sha256",
+                "hash_status",
+                "hash_checked_at",
+            ])
+
+        ticket.software_package = None
+
     ticket.full_clean()
 
-    ticket.save(
-        update_fields=[
-            "software",
-            "deployment_target",
-            "source_version",
-            "target_version",
-            "risks",
-            "window_start_at",
-            "window_end_at",
-            "updated_at",
-        ]
-    )
+    update_fields = [
+        "software",
+        "deployment_target",
+        "software_package",
+        "source_version",
+        "target_version",
+        "package_file",
+        "expected_sha256",
+        "actual_sha256",
+        "hash_status",
+        "hash_checked_at",
+        "risks",
+        "window_start_at",
+        "window_end_at",
+        "updated_at",
+    ]
+
+    ticket.save(update_fields=update_fields)
 
     record_event(
         actor=actor,
         action=AuditAction.CHANGE_UPDATED,
         obj=ticket,
         details={
-            "changed_fields": changed_fields,
+            "changed_fields": sorted(set(changed_fields)),
             "deployment_target_id": str(target.pk),
+            "software_package_id": (
+                str(ticket.software_package_id)
+                if ticket.software_package_id
+                else None
+            ),
+            "target_version": ticket.target_version,
             "status": ticket.status.code,
         },
     )
     return ticket
+
 
 # ---------------------------------------------------------
 # УПРАВЛЕНИЕ ПЛАНОВЫМИ ШАГАМИ
