@@ -1,17 +1,23 @@
 from django.contrib.admin.utils import quote
 from django.contrib.auth.decorators import permission_required
 from django.core.exceptions import ValidationError
+from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import path, reverse
 from django.views.decorators.http import require_POST
 
 from wagtail.admin import messages
 from wagtail.admin.menu import MenuItem
+from wagtail.admin.ui.tables import Column
 from wagtail.admin.views import generic
 from wagtail.admin.viewsets.model import ModelViewSet
 
 from .forms import ChangeTicketForm
-from .models import ChangeTicket, PlanStep
+from .models import (
+    ChangeTicket,
+    PlanStep,
+    ApprovalRecord,
+)
 from .plan_forms import PlanStepForm
 from .permissions import (
     CardStatusCode,
@@ -68,6 +74,46 @@ def _get_action_error_message(error):
 
 
 # ============================================================
+# ОПРЕДЕЛЕНИЕ ОТОБРАЖАЕМОГО СТАТУСА
+# ============================================================
+
+def _ticket_workflow_status(ticket):
+    """
+    Возвращает понятный статус карточки.
+
+    Если карточка имеет статус DRAFT,
+    а последнее решение руководителя REJECTED,
+    показываем «Возвращена на доработку».
+
+    В базе данных статус остаётся DRAFT.
+    """
+
+    records = getattr(
+        ticket,
+        "prefetched_approval_records",
+        None,
+    )
+
+    if records is None:
+        latest_record = (
+            ticket.approval_records
+            .order_by("-decided_at")
+            .first()
+        )
+    else:
+        latest_record = records[0] if records else None
+
+    if (
+        ticket.status.code == CardStatusCode.DRAFT
+        and latest_record is not None
+        and latest_record.decision == "rejected"
+    ):
+        return "Возвращена на доработку"
+
+    return str(ticket.status)
+
+
+# ============================================================
 # ПУНКТ МЕНЮ
 # ============================================================
 
@@ -110,6 +156,17 @@ class ChangeTicketIndexView(generic.IndexView):
                 "status",
                 "created_by",
                 "approved_by",
+            )
+            .prefetch_related(
+                Prefetch(
+                    "approval_records",
+                    queryset=ApprovalRecord.objects.only(
+                        "ticket_id",
+                        "decision",
+                        "decided_at",
+                    ).order_by("-decided_at"),
+                    to_attr="prefetched_approval_records",
+                )
             )
         )
 
@@ -231,6 +288,40 @@ class ChangeTicketInspectView(generic.InspectView):
         ticket = self.object
         user = self.request.user
 
+        # ----------------------------------------------------
+        # ИСТОРИЯ СОГЛАСОВАНИЙ
+        # ----------------------------------------------------
+
+        approval_records = list(
+            ticket.approval_records
+            .select_related("approver")
+            .order_by("-decided_at")
+        )
+
+        latest_approval_record = (
+            approval_records[0]
+            if approval_records
+            else None
+        )
+
+        is_returned_for_rework = (
+            ticket.status.code == CardStatusCode.DRAFT
+            and latest_approval_record is not None
+            and latest_approval_record.decision == "rejected"
+        )
+
+        context["approval_records"] = approval_records
+
+        context["latest_approval_record"] = latest_approval_record
+
+        context["is_returned_for_rework"] = (
+            is_returned_for_rework
+        )
+
+        # ----------------------------------------------------
+        # ПРАВА НА КАРТОЧКУ
+        # ----------------------------------------------------
+
         is_owner = ticket.created_by_id == user.pk
 
         is_draft = (
@@ -242,6 +333,7 @@ class ChangeTicketInspectView(generic.InspectView):
         )
 
         # Исполнитель может отправлять только собственный черновик.
+        # Это распространяется и на возвращённые карточки.
         context["can_submit_for_approval"] = (
             change_ticket_policy.user_has_permission_for_instance(
                 user,
@@ -792,7 +884,11 @@ class ChangeTicketViewSet(ModelViewSet):
         "software_package",
         "source_version",
         "target_version",
-        "status",
+        Column(
+            "workflow_status",
+            label="Статус карточки",
+            accessor=_ticket_workflow_status,
+        ),
         "window_start_at",
         "window_end_at",
         "created_by",
@@ -870,18 +966,16 @@ class ChangeTicketViewSet(ModelViewSet):
                 reject_ticket_action,
                 name="reject",
             ),
-                        path(
+            path(
                 f"plan/<{conv}:pk>/add/",
                 plan_step_add_action,
                 name="plan_step_add",
             ),
-
             path(
                 f"plan/<{conv}:pk>/steps/<{conv}:step_id>/update/",
                 plan_step_update_action,
                 name="plan_step_update",
             ),
-
             path(
                 f"plan/<{conv}:pk>/steps/<{conv}:step_id>/delete/",
                 plan_step_delete_action,

@@ -1,0 +1,211 @@
+
+{% extends "wagtailadmin/generic/inspect.html" %}
+
+{% block fields_output %}
+
+    {{ block.super }}
+
+    <section class="w-mt-6">
+        <h2 class="w-text-xl w-font-semibold">
+            План изменений
+        </h2>
+
+        {% if plan_steps %}
+
+            {% for item in plan_step_items %}
+
+                <div class="w-mt-4 w-p-4 w-border w-rounded-lg">
+
+                    <h3 class="w-text-lg w-font-semibold">
+                        {{ item.step.step_order }}.
+                        {{ item.step.name }}
+                    </h3>
+
+                    <p>
+                        <strong>Тип:</strong>
+                        {{ item.step.get_step_kind_display }}
+                    </p>
+
+                    <p>
+                        <strong>Плановая длительность:</strong>
+                        {{ item.step.planned_duration_min }} мин.
+                    </p>
+
+                    {% if item.step.description %}
+                        <p>
+                            {{ item.step.description }}
+                        </p>
+                    {% endif %}
+
+                    {% if can_manage_plan %}
+
+                        <details class="w-mt-3">
+                            <summary>
+                                Редактировать шаг
+                            </summary>
+
+                            <form
+                                method="post"
+                                action="{{ item.update_url }}"
+                                class="w-mt-3"
+                            >
+                                {% csrf_token %}
+
+                                {{ item.form.as_p }}
+
+                                <button
+                                    type="submit"
+                                    class="button button-primary"
+                                >
+                                    Сохранить изменения
+                                </button>
+                            </form>
+                        </details>
+
+                        {% if item.is_last %}
+                            <form
+                                method="post"
+                                action="{{ item.delete_url }}"
+                                class="w-mt-3"
+                                onsubmit="return confirm('Удалить последний шаг плана?');"
+                            >
+                                {% csrf_token %}
+
+                                <button
+                                    type="submit"
+                                    class="button button-secondary"
+                                >
+                                    Удалить последний шаг
+                                </button>
+                            </form>
+                        {% endif %}
+
+                    {% endif %}
+
+                </div>
+
+            {% endfor %}
+
+        {% else %}
+
+            <p class="w-mt-3">
+                План изменений пока не составлен.
+            </p>
+
+        {% endif %}
+
+
+        {% if can_manage_plan %}
+
+            <div class="w-mt-6 w-p-4 w-border w-rounded-lg">
+
+                <h3 class="w-text-lg w-font-semibold">
+                    Добавить шаг плана
+                </h3>
+
+                <form
+                    method="post"
+                    action="{{ plan_add_url }}"
+                    class="w-mt-3"
+                >
+                    {% csrf_token %}
+
+                    {{ plan_add_form.as_p }}
+
+                    <button
+                        type="submit"
+                        class="button button-primary"
+                    >
+                        Добавить шаг
+                    </button>
+                </form>
+
+            </div>
+
+        {% endif %}
+
+    </section>
+
+
+    {% if can_submit_for_approval %}
+
+        <div class="w-mt-6">
+
+            <form
+                method="post"
+                action="{{ submit_for_approval_url }}"
+            >
+                {% csrf_token %}
+
+                <button
+                    type="submit"
+                    class="button button-primary"
+                >
+                    Отправить на согласование
+                </button>
+            </form>
+
+        </div>
+
+    {% endif %}
+
+
+    {% if can_approve_ticket %}
+
+        <div class="w-mt-6">
+
+            <form
+                method="post"
+                action="{{ approve_ticket_url }}"
+            >
+                {% csrf_token %}
+
+                <button
+                    type="submit"
+                    class="button button-primary"
+                >
+                    Согласовать
+                </button>
+            </form>
+
+        </div>
+
+    {% endif %}
+
+
+    {% if can_reject_ticket %}
+
+        <div class="w-mt-6">
+
+            <form
+                method="post"
+                action="{{ reject_ticket_url }}"
+            >
+                {% csrf_token %}
+
+                <label for="rejection-comment">
+                    Причина отклонения
+                </label>
+
+                <textarea
+                    id="rejection-comment"
+                    name="comment"
+                    rows="4"
+                    required
+                    maxlength="5000"
+                ></textarea>
+
+                <button
+                    type="submit"
+                    class="button button-secondary"
+                >
+                    Отклонить
+                </button>
+
+            </form>
+
+        </div>
+
+    {% endif %}
+
+{% endblock %}

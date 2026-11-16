@@ -1,11 +1,170 @@
-
 {% extends "wagtailadmin/generic/inspect.html" %}
 
 {% block fields_output %}
 
     {{ block.super }}
 
+    <!-- ============================================ -->
+    <!-- РЕЗУЛЬТАТ СОГЛАСОВАНИЯ -->
+    <!-- ============================================ -->
+
+    {% if latest_approval_record %}
+
+        <section class="w-mt-6 w-p-4 w-border w-rounded-lg">
+
+            <h2 class="w-text-xl w-font-semibold">
+                Результат согласования
+            </h2>
+
+            {% if is_returned_for_rework %}
+
+                <p class="w-mt-3">
+                    <strong>Карточка возвращена на доработку.</strong>
+                </p>
+
+                <p>
+                    Руководитель:
+                    {{ latest_approval_record.approver.get_full_name|default:latest_approval_record.approver.username }}
+                </p>
+
+                <p>
+                    Дата решения:
+                    {{ latest_approval_record.decided_at|date:"d.m.Y H:i" }}
+                </p>
+
+                <div class="w-mt-3">
+                    <strong>Комментарий руководителя:</strong>
+
+                    <blockquote>
+                        {{ latest_approval_record.comment|linebreaksbr }}
+                    </blockquote>
+                </div>
+
+                <p class="w-mt-3">
+                    Исправьте карточку с учётом замечаний
+                    и повторно отправьте её на согласование.
+                </p>
+
+            {% elif latest_approval_record.decision == "approved" %}
+
+                <p class="w-mt-3">
+                    <strong>Изменение согласовано.</strong>
+                </p>
+
+                <p>
+                    Руководитель:
+                    {{ latest_approval_record.approver.get_full_name|default:latest_approval_record.approver.username }}
+                </p>
+
+                <p>
+                    Дата согласования:
+                    {{ latest_approval_record.decided_at|date:"d.m.Y H:i" }}
+                </p>
+
+                {% if latest_approval_record.comment %}
+                    <p>
+                        Комментарий:
+                        {{ latest_approval_record.comment|linebreaksbr }}
+                    </p>
+                {% endif %}
+
+            {% else %}
+
+                <p>
+                    Последнее решение:
+                    {{ latest_approval_record.get_decision_display }}
+                </p>
+
+                <p>
+                    Руководитель:
+                    {{ latest_approval_record.approver.get_full_name|default:latest_approval_record.approver.username }}
+                </p>
+
+                <p>
+                    Дата:
+                    {{ latest_approval_record.decided_at|date:"d.m.Y H:i" }}
+                </p>
+
+                {% if latest_approval_record.comment %}
+                    <p>
+                        Комментарий:
+                        {{ latest_approval_record.comment|linebreaksbr }}
+                    </p>
+                {% endif %}
+
+            {% endif %}
+
+        </section>
+
+    {% endif %}
+
+
+    <!-- ============================================ -->
+    <!-- ПОЛНАЯ ИСТОРИЯ РЕШЕНИЙ -->
+    <!-- ============================================ -->
+
+    {% if approval_records %}
+
+        <section class="w-mt-6">
+
+            <h2 class="w-text-xl w-font-semibold">
+                История согласований
+            </h2>
+
+            <table class="listing w-mt-3">
+
+                <thead>
+                    <tr>
+                        <th>Дата</th>
+                        <th>Руководитель</th>
+                        <th>Решение</th>
+                        <th>Комментарий</th>
+                    </tr>
+                </thead>
+
+                <tbody>
+
+                    {% for record in approval_records %}
+
+                        <tr>
+                            <td>
+                                {{ record.decided_at|date:"d.m.Y H:i" }}
+                            </td>
+
+                            <td>
+                                {{ record.approver.get_full_name|default:record.approver.username }}
+                            </td>
+
+                            <td>
+                                {{ record.get_decision_display }}
+                            </td>
+
+                            <td>
+                                {% if record.comment %}
+                                    {{ record.comment|linebreaksbr }}
+                                {% else %}
+                                    —
+                                {% endif %}
+                            </td>
+                        </tr>
+
+                    {% endfor %}
+
+                </tbody>
+
+            </table>
+
+        </section>
+
+    {% endif %}
+
+
+    <!-- ============================================ -->
+    <!-- ПЛАН ИЗМЕНЕНИЙ -->
+    <!-- ============================================ -->
+
     <section class="w-mt-6">
+
         <h2 class="w-text-xl w-font-semibold">
             План изменений
         </h2>
@@ -40,6 +199,7 @@
                     {% if can_manage_plan %}
 
                         <details class="w-mt-3">
+
                             <summary>
                                 Редактировать шаг
                             </summary>
@@ -60,9 +220,11 @@
                                     Сохранить изменения
                                 </button>
                             </form>
+
                         </details>
 
                         {% if item.is_last %}
+
                             <form
                                 method="post"
                                 action="{{ item.delete_url }}"
@@ -78,6 +240,7 @@
                                     Удалить последний шаг
                                 </button>
                             </form>
+
                         {% endif %}
 
                     {% endif %}
@@ -93,7 +256,6 @@
             </p>
 
         {% endif %}
-
 
         {% if can_manage_plan %}
 
@@ -127,6 +289,10 @@
     </section>
 
 
+    <!-- ============================================ -->
+    <!-- ОТПРАВКА НА СОГЛАСОВАНИЕ -->
+    <!-- ============================================ -->
+
     {% if can_submit_for_approval %}
 
         <div class="w-mt-6">
@@ -143,12 +309,17 @@
                 >
                     Отправить на согласование
                 </button>
+
             </form>
 
         </div>
 
     {% endif %}
 
+
+    <!-- ============================================ -->
+    <!-- СОГЛАСОВАНИЕ -->
+    <!-- ============================================ -->
 
     {% if can_approve_ticket %}
 
@@ -166,12 +337,17 @@
                 >
                     Согласовать
                 </button>
+
             </form>
 
         </div>
 
     {% endif %}
 
+
+    <!-- ============================================ -->
+    <!-- ОТКЛОНЕНИЕ -->
+    <!-- ============================================ -->
 
     {% if can_reject_ticket %}
 

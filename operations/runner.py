@@ -4,6 +4,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
+from backups.models import Backup
 from backups.services import verify_backup
 from changes.models import StepKind
 from deployments.adapters.registry import get_deployment_adapter
@@ -23,7 +24,7 @@ class StepRunnerError(operation_services.OperationServiceError):
 
 
 # ==========================================================
-# ПОЛУЧЕНИЕ И ПРОВЕРКА ШАГА
+# ПОЛУЧЕНИЕ ПРОВЕРКА ШАГА
 # ==========================================================
 
 def _get_step_context(step_execution_id):
@@ -78,7 +79,8 @@ def _validate_automatic_step(operation, step):
             StepKind.VERIFICATION,
         }:
             raise StepRunnerError(
-                "Для операции обновления указан неподдерживаемый тип шага."
+                "Для операции обновления указан "
+                "неподдерживаемый тип шага."
             )
 
     elif operation.operation_type == OperationType.ROLLBACK:
@@ -88,7 +90,8 @@ def _validate_automatic_step(operation, step):
             StepKind.VERIFICATION,
         }:
             raise StepRunnerError(
-                "Для операции отката указан неподдерживаемый тип шага."
+                "Для операции отката указан "
+                "неподдерживаемый тип шага."
             )
 
     else:
@@ -179,9 +182,9 @@ def _get_rollback_expected_version(operation, verification_step):
 # РЕЗЕРВНОЕ КОПИРОВАНИЕ
 # ==========================================================
 
-def _execute_backup(adapter, operation, actor):
+def _execute_backup(adapter, operation, ticket, actor):
     """
-    Создаёт резервную копию и проверяет её целостность.
+    Создаёт и проверяет резервную копию исходной версии ПО.
     """
 
     before = adapter.inspect()
@@ -192,13 +195,28 @@ def _execute_backup(adapter, operation, actor):
             "в целевой установке нет установленной версии."
         )
 
+    expected_version = str(
+        ticket.source_version or ""
+    ).strip()
+
+    if not expected_version:
+        raise StepRunnerError(
+            "В карточке не указана исходная версия программного обеспечения."
+        )
+
+    if before.current_version != expected_version:
+        raise StepRunnerError(
+            "Фактическая версия на стенде не совпадает "
+            "с исходной версией карточки. "
+            f"Ожидается: {expected_version}; "
+            f"обнаружена: {before.current_version}."
+        )
+
     backup = adapter.create_backup(
         operation_id=operation.pk,
         actor=actor,
     )
 
-    # Новая резервная копия первоначально имеет статус NOT_CHECKED.
-    # Проверяем её реальное содержимое.
     verified_backup = verify_backup(
         backup_id=backup.pk,
         actor=actor,
@@ -230,10 +248,138 @@ def _execute_backup(adapter, operation, actor):
 # УСТАНОВКА НОВОЙ ВЕРСИИ
 # ==========================================================
 
-def _execute_deployment(adapter, ticket, target):
+def _execute_deployment(
+    adapter,
+    operation,
+    ticket,
+    target,
+    actor,
+):
     """
     Выполняет установку пакета обновления.
+
+    Перед установкой:
+    - проверяет завершённый шаг резервного копирования;
+    - проверяет соответствие резервной копии операции;
+    - повторно проверяет её целостность;
+    - проверяет фактическую исходную версию.
+
+    После установки:
+    - проверяет результат адаптера;
+    - выполняет health_check;
+    - только после успешной проверки возвращает результат.
     """
+
+    # --------------------------------------------------------
+    # 1. Проверяем завершённый шаг резервного копирования.
+    # --------------------------------------------------------
+
+    backup_step = (
+        StepExecution.objects
+        .filter(
+            operation=operation,
+            step_order=1,
+            step_kind=StepKind.BACKUP,
+            status=StepExecutionStatus.COMPLETED,
+        )
+        .first()
+    )
+
+    if backup_step is None:
+        raise StepRunnerError(
+            "Нельзя выполнять обновление: "
+            "первый шаг резервного копирования не завершён."
+        )
+
+    backup_data = _load_result(backup_step)
+
+    if backup_data.get("action") != "backup":
+        raise StepRunnerError(
+            "Результат первого шага не подтверждает создание "
+            "резервной копии."
+        )
+
+    # --------------------------------------------------------
+    # 2. Проверяем версию, сохранённую в резервной копии.
+    # --------------------------------------------------------
+
+    expected_source_version = str(
+        ticket.source_version or ""
+    ).strip()
+
+    if not expected_source_version:
+        raise StepRunnerError(
+            "В карточке не указана исходная версия ПО."
+        )
+
+    if backup_data.get("version") != expected_source_version:
+        raise StepRunnerError(
+            "Версия в результате резервного копирования "
+            "не совпадает с исходной версией карточки."
+        )
+
+    # --------------------------------------------------------
+    # 3. Проверяем принадлежность резервной копии операции.
+    # --------------------------------------------------------
+
+    backup = (
+        Backup.objects
+        .filter(operation=operation)
+        .order_by("-created_at")
+        .first()
+    )
+
+    if (
+        backup is None
+        or str(backup.pk) != str(backup_data.get("backup_id"))
+    ):
+        raise StepRunnerError(
+            "Не найдена резервная копия, зарегистрированная "
+            "первым шагом этой операции."
+        )
+
+    # --------------------------------------------------------
+    # 4. Повторно проверяем физический файл резервной копии.
+    # --------------------------------------------------------
+
+    verified_backup = verify_backup(
+        backup_id=backup.pk,
+        actor=actor,
+    )
+
+    if not verified_backup.is_usable:
+        reason = (
+            verified_backup.verification_error
+            or "Целостность резервной копии не подтверждена."
+        )
+
+        raise StepRunnerError(
+            "Обновление запрещено: резервная копия "
+            f"не прошла повторную проверку. {reason}"
+        )
+
+    # --------------------------------------------------------
+    # 5. Проверяем фактическую исходную версию стенда.
+    # --------------------------------------------------------
+
+    before = adapter.inspect()
+
+    if not before.installed:
+        raise StepRunnerError(
+            "Перед обновлением на целевой установке "
+            "не обнаружена установленная версия ПО."
+        )
+
+    if before.current_version != expected_source_version:
+        raise StepRunnerError(
+            "Перед установкой обнаружено несоответствие исходной версии. "
+            f"Ожидается: {expected_source_version}; "
+            f"обнаружена: {before.current_version}."
+        )
+
+    # --------------------------------------------------------
+    # 6. Устанавливаем пакет.
+    # --------------------------------------------------------
 
     result = adapter.deploy(ticket)
 
@@ -242,14 +388,37 @@ def _execute_deployment(adapter, ticket, target):
             "Адаптер вернул идентификатор другой целевой установки."
         )
 
-    if not result.version or not result.release_id:
+    expected_target_version = str(ticket.target_version)
+
+    if (
+        not result.version
+        or str(result.version) != expected_target_version
+        or not result.release_id
+    ):
         raise StepRunnerError(
-            "Адаптер не вернул подтверждённые данные установленной версии."
+            "Результат установки не подтверждает ожидаемую "
+            "целевую версию."
         )
 
-    if str(result.version) != str(ticket.target_version):
+    # --------------------------------------------------------
+    # 7. Обязательно проверяем фактическую установленную версию.
+    # --------------------------------------------------------
+
+    health = adapter.health_check(
+        expected_version=expected_target_version,
+    )
+
+    if not health.ok:
         raise StepRunnerError(
-            "Установленная версия не совпадает с целевой версией карточки."
+            "Установка выполнена, но проверка целевой установки "
+            f"не пройдена. {health.message}"
+        )
+
+    if health.version != expected_target_version:
+        raise StepRunnerError(
+            "После установки обнаружена неожиданная версия. "
+            f"Ожидалась: {expected_target_version}; "
+            f"обнаружена: {health.version}."
         )
 
     return {
@@ -258,6 +427,11 @@ def _execute_deployment(adapter, ticket, target):
         "version": result.version,
         "release_id": result.release_id,
         "target_id": result.target_id,
+        "source_version": before.current_version,
+        "backup_id": str(verified_backup.pk),
+        "backup_sha256": verified_backup.file_sha256,
+        "health_check": health.message,
+        "health_check_ok": health.ok,
     }
 
 
@@ -372,6 +546,7 @@ def _perform_action(
         return _execute_backup(
             adapter,
             operation,
+            ticket,
             actor,
         )
 
@@ -381,8 +556,10 @@ def _perform_action(
     ):
         return _execute_deployment(
             adapter,
+            operation,
             ticket,
             target,
+            actor,
         )
 
     if (
@@ -417,7 +594,7 @@ def _update_target_version(target_id, version):
     """
     Сохраняет последнюю подтверждённую версию установки.
 
-    Глобальную версию MuseumSoftware не изменяет.
+    Глобальную версию программного обеспечения не изменяет.
     """
 
     if not version:
@@ -475,8 +652,8 @@ def _refresh_target_after_failure(adapter, target_id):
 
 def _format_error(error):
     """
-    Получает текст ошибки без представления объекта исключения
-    в виде технического списка Django.
+    Получает текст ошибки без технического представления
+    объекта исключения Django.
     """
 
     if isinstance(error, ValidationError):
