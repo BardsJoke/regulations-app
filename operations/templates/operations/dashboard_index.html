@@ -1,0 +1,156 @@
+{% extends "wagtailadmin/base.html" %}
+
+{% block titletag %}Операции{% endblock %}
+
+{% block content %}
+
+    {% include "wagtailadmin/shared/header.html" with title="Операции" %}
+
+    <div class="nice-padding">
+
+        {% if can_start_updates %}
+
+            <section class="w-mb-6">
+
+                <h2>Согласованные изменения</h2>
+
+                {% if approved_tickets %}
+
+                    <table class="listing">
+                        <thead>
+                            <tr>
+                                <th>Программное обеспечение</th>
+                                <th>Целевая установка</th>
+                                <th>Версия</th>
+                                <th>Плановое окно</th>
+                                <th>Действие</th>
+                            </tr>
+                        </thead>
+
+                        <tbody>
+                            {% for ticket in approved_tickets %}
+
+                                <tr>
+                                    <td>
+                                        <a href="{% url 'change_tickets:inspect' ticket.pk %}">
+                                            {{ ticket.software.name }}
+                                        </a>
+                                    </td>
+
+                                    <td>
+                                        {{ ticket.deployment_target.name }}
+                                    </td>
+
+                                    <td>
+                                        {{ ticket.source_version }}
+                                        →
+                                        {{ ticket.target_version }}
+                                    </td>
+
+                                    <td>
+                                        {{ ticket.window_start_at|date:"d.m.Y H:i" }}
+                                    </td>
+
+                                    <td>
+                                        <form
+                                            method="post"
+                                            action="{% url 'operations_dashboard:start_update' ticket.pk %}"
+                                        >
+                                            {% csrf_token %}
+
+                                            <button
+                                                type="submit"
+                                                class="button button-primary"
+                                            >
+                                                Начать обновление
+                                            </button>
+                                        </form>
+                                    </td>
+                                </tr>
+
+                            {% endfor %}
+                        </tbody>
+                    </table>
+
+                {% else %}
+
+                    <p>
+                        Нет согласованных карточек, готовых к запуску обновления.
+                    </p>
+
+                {% endif %}
+
+            </section>
+
+            <hr>
+
+        {% endif %}
+
+
+        <section>
+
+            <h2>История операций</h2>
+
+            {% if operations %}
+
+                <table class="listing">
+                    <thead>
+                        <tr>
+                            <th>Операция</th>
+                            <th>Программное обеспечение</th>
+                            <th>Целевая установка</th>
+                            <th>Попытка</th>
+                            <th>Статус</th>
+                            <th>Начало</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>
+                        {% for operation in operations %}
+
+                            <tr>
+                                <td>
+                                    <a href="{% url 'operations_dashboard:detail' operation.pk %}">
+                                        {{ operation.get_operation_type_display }}
+                                        №{{ operation.sequence_number }}
+                                    </a>
+                                </td>
+
+                                <td>
+                                    {{ operation.change_ticket.software.name }}
+                                </td>
+
+                                <td>
+                                    {{ operation.change_ticket.deployment_target.name }}
+                                </td>
+
+                                <td>
+                                    {{ operation.attempt_number }}
+                                </td>
+
+                                <td>
+                                    {{ operation.get_status_display }}
+                                </td>
+
+                                <td>
+                                    {{ operation.started_at|date:"d.m.Y H:i" }}
+                                </td>
+                            </tr>
+
+                        {% endfor %}
+                    </tbody>
+                </table>
+
+            {% else %}
+
+                <p>
+                    Операции пока не создавались.
+                </p>
+
+            {% endif %}
+
+        </section>
+
+    </div>
+
+{% endblock %}

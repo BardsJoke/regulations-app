@@ -1,0 +1,371 @@
+{% extends "wagtailadmin/base.html" %}
+
+{% block titletag %}
+    Операция №{{ operation.sequence_number }}
+{% endblock %}
+
+{% block content %}
+
+    {% include "wagtailadmin/shared/header.html" with title="Подробности операции" %}
+
+    <div class="nice-padding">
+
+        <p>
+            <a href="{% url 'operations_dashboard:index' %}">
+                ← К списку операций
+            </a>
+        </p>
+
+        <section class="w-mb-6">
+
+            <h2>
+                {{ operation.get_operation_type_display }}
+                №{{ operation.sequence_number }}
+            </h2>
+
+            <p>
+                <strong>Статус:</strong>
+                {{ operation.get_status_display }}
+            </p>
+
+            <p>
+                <strong>Попытка:</strong>
+                {{ operation.attempt_number }}
+            </p>
+
+            <p>
+                <strong>Программное обеспечение:</strong>
+                {{ ticket.software.name }}
+            </p>
+
+            <p>
+                <strong>Целевая установка:</strong>
+                {{ ticket.deployment_target.name }}
+            </p>
+
+            <p>
+                <strong>Карточка изменения:</strong>
+                <a href="{{ ticket_url }}">
+                    {{ ticket }}
+                </a>
+            </p>
+
+            <p>
+                <strong>Инициатор:</strong>
+                {{ operation.initiated_by }}
+            </p>
+
+            <p>
+                <strong>Начало:</strong>
+                {{ operation.started_at|date:"d.m.Y H:i:s" }}
+            </p>
+
+            {% if operation.finished_at %}
+                <p>
+                    <strong>Завершение:</strong>
+                    {{ operation.finished_at|date:"d.m.Y H:i:s" }}
+                </p>
+            {% endif %}
+
+            {% if operation.parent_operation %}
+                <p>
+                    <strong>Исходная операция:</strong>
+                    <a href="{% url 'operations_dashboard:detail' operation.parent_operation.pk %}">
+                        {{ operation.parent_operation }}
+                    </a>
+                </p>
+            {% endif %}
+
+            {% if operation.rollback_reason %}
+                <p>
+                    <strong>Причина отката:</strong>
+                    {{ operation.rollback_reason.name }}
+                </p>
+            {% endif %}
+
+            {% if operation.backup_used %}
+                <p>
+                    <strong>Использованная резервная копия:</strong>
+                    {{ operation.backup_used.created_at|date:"d.m.Y H:i:s" }}
+                </p>
+                <p>
+                    <strong>SHA-256 резервной копии:</strong>
+                    <code>{{ operation.backup_used.file_sha256 }}</code>
+                </p>
+            {% endif %}
+
+            {% if operation.result_summary %}
+                <h3>Итог операции</h3>
+                <pre>{{ operation.result_summary }}</pre>
+            {% endif %}
+
+            {% if operation.error_message %}
+                <h3>Ошибка операции</h3>
+                <pre>{{ operation.error_message }}</pre>
+            {% endif %}
+
+        </section>
+
+
+        <hr>
+
+        <section class="w-mt-6">
+
+            <h2>Последовательность шагов</h2>
+
+            {% for step in steps %}
+
+                <div class="w-mt-4 w-p-4 w-border w-rounded-lg">
+
+                    <h3>
+                        {{ step.step_order }}.
+                        {{ step.name }}
+                    </h3>
+
+                    <p>
+                        <strong>Тип:</strong>
+                        {{ step.get_step_kind_display }}
+                    </p>
+
+                    <p>
+                        <strong>Статус:</strong>
+                        {{ step.get_status_display }}
+                    </p>
+
+                    <p>
+                        <strong>Плановая длительность:</strong>
+                        {{ step.planned_duration_min }} мин.
+                    </p>
+
+                    {% if step.description %}
+                        <p>{{ step.description }}</p>
+                    {% endif %}
+
+                    {% if step.started_at %}
+                        <p>
+                            <strong>Начало:</strong>
+                            {{ step.started_at|date:"d.m.Y H:i:s" }}
+                        </p>
+                    {% endif %}
+
+                    {% if step.finished_at %}
+                        <p>
+                            <strong>Завершение:</strong>
+                            {{ step.finished_at|date:"d.m.Y H:i:s" }}
+                        </p>
+                    {% endif %}
+
+                    {% if step.started_by %}
+                        <p>
+                            <strong>Начал:</strong>
+                            {{ step.started_by }}
+                        </p>
+                    {% endif %}
+
+                    {% if step.finished_by %}
+                        <p>
+                            <strong>Завершил:</strong>
+                            {{ step.finished_by }}
+                        </p>
+                    {% endif %}
+
+
+                    {% if step.result %}
+                        <h4>Результат</h4>
+                        <pre>{{ step.result }}</pre>
+                    {% endif %}
+
+                    {% if step.error_message %}
+                        <h4>Ошибка шага</h4>
+                        <pre>{{ step.error_message }}</pre>
+                    {% endif %}
+
+
+                    {% if can_execute_steps and step.status == "available" %}
+
+                        {% if step.step_kind == "other" %}
+
+                            <form
+                                method="post"
+                                action="{% url 'operations_dashboard:start_manual_step' step.pk %}"
+                                class="w-mt-3"
+                            >
+                                {% csrf_token %}
+
+                                <button
+                                    type="submit"
+                                    class="button button-primary"
+                                >
+                                    Начать ручной шаг
+                                </button>
+                            </form>
+
+                        {% else %}
+
+                            <form
+                                method="post"
+                                action="{% url 'operations_dashboard:execute_step' step.pk %}"
+                                class="w-mt-3"
+                            >
+                                {% csrf_token %}
+
+                                <button
+                                    type="submit"
+                                    class="button button-primary"
+                                >
+                                    Выполнить шаг
+                                </button>
+                            </form>
+
+                        {% endif %}
+
+                    {% endif %}
+
+
+                    {% if can_execute_steps and step.status == "in_progress" and step.step_kind == "other" %}
+
+                        <form
+                            method="post"
+                            action="{% url 'operations_dashboard:complete_manual_step' step.pk %}"
+                            class="w-mt-3"
+                        >
+                            {% csrf_token %}
+
+                            <label for="manual-result-{{ step.pk }}">
+                                Результат выполнения
+                            </label>
+
+                            <textarea
+                                id="manual-result-{{ step.pk }}"
+                                name="result"
+                                rows="4"
+                                maxlength="10000"
+                                required
+                            ></textarea>
+
+                            <button
+                                type="submit"
+                                class="button button-primary"
+                            >
+                                Завершить ручной шаг
+                            </button>
+                        </form>
+
+                    {% endif %}
+
+                </div>
+
+            {% empty %}
+
+                <p>
+                    У операции пока нет шагов.
+                </p>
+
+            {% endfor %}
+
+        </section>
+
+
+        {% if can_start_rollback %}
+
+            <hr>
+
+            <section class="w-mt-6">
+
+                <h2>Запуск отката</h2>
+
+                <p>
+                    Откат восстановит выбранную резервную копию
+                    в целевой установке.
+                </p>
+
+                {% if rollback_templates_ready and rollback_backups and rollback_reasons %}
+
+                    <form
+                        method="post"
+                        action="{% url 'operations_dashboard:start_rollback' operation.pk %}"
+                    >
+                        {% csrf_token %}
+
+                        <div class="w-mb-4">
+
+                            <label for="backup-id">
+                                Резервная копия
+                            </label>
+
+                            <select
+                                id="backup-id"
+                                name="backup_id"
+                                required
+                            >
+                                <option value="">
+                                    Выберите резервную копию
+                                </option>
+
+                                {% for backup in rollback_backups %}
+
+                                    <option value="{{ backup.pk }}">
+                                        {{ backup.created_at|date:"d.m.Y H:i:s" }}
+                                        — {{ backup.size_bytes|filesizeformat }}
+                                        — SHA {{ backup.file_sha256|slice:":12" }}
+                                    </option>
+
+                                {% endfor %}
+
+                            </select>
+
+                        </div>
+
+                        <div class="w-mb-4">
+
+                            <label for="rollback-reason">
+                                Причина отката
+                            </label>
+
+                            <select
+                                id="rollback-reason"
+                                name="rollback_reason_id"
+                                required
+                            >
+                                <option value="">
+                                    Выберите причину
+                                </option>
+
+                                {% for reason in rollback_reasons %}
+
+                                    <option value="{{ reason.pk }}">
+                                        {{ reason.name }}
+                                    </option>
+
+                                {% endfor %}
+
+                            </select>
+
+                        </div>
+
+                        <button
+                            type="submit"
+                            class="button button-primary"
+                        >
+                            Создать операцию отката
+                        </button>
+
+                    </form>
+
+                {% else %}
+
+                    <p>
+                        Для отката пока не хватает настроек:
+                        активной причины, проверенной резервной копии
+                        или активных шаблонов шагов.
+                    </p>
+
+                {% endif %}
+
+            </section>
+
+        {% endif %}
+
+    </div>
+
+{% endblock %}
