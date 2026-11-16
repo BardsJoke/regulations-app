@@ -1,0 +1,7 @@
+{
+  "name": "Museum Collection Registry Demo",
+  "version": "1.0.0",
+  "release_type": "laboratory",
+  "description": "Исходная версия демонстрационного реестра музейной коллекции.",
+  "entrypoint": "application/main.py"
+}

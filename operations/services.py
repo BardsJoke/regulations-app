@@ -1,3 +1,4 @@
+
 import hashlib
 
 from django.core.exceptions import PermissionDenied, ValidationError
@@ -47,7 +48,6 @@ def _require_executor(actor):
             "Для выполнения операции необходимо войти в систему."
         )
 
-    # В модели RoleAssignment отсутствует поле is_active.
     has_executor_role = RoleAssignment.objects.filter(
         user=actor,
         role=ModuleRole.EXECUTOR,
@@ -56,6 +56,19 @@ def _require_executor(actor):
     if not has_executor_role:
         raise PermissionDenied(
             "Недостаточно прав: требуется роль исполнителя."
+        )
+
+
+def _require_operation_owner(actor, operation):
+    """
+    Разрешает выполнять шаги только автору карточки изменения,
+    к которой относится операция.
+    """
+
+    if operation.change_ticket.created_by_id != actor.pk:
+        raise PermissionDenied(
+            "Исполнитель может выполнять операции "
+            "только по собственным карточкам изменений."
         )
 
 
@@ -88,8 +101,7 @@ def _lock_and_validate_deployment_target(ticket):
     выполнения операции на ней.
 
     is_configured проверяет настройки в базе данных.
-    Реальное соединение с установкой будет проверяться
-    отдельным адаптером развертывания.
+    Реальное соединение с установкой проверяется адаптером.
     """
 
     if not ticket.deployment_target_id:
@@ -283,6 +295,7 @@ def start_step(step_execution_id, actor):
 
     Проверяет:
     - права исполнителя;
+    - принадлежность операции пользователю;
     - состояние операции;
     - доступность шага;
     - завершение предыдущих шагов;
@@ -295,6 +308,9 @@ def start_step(step_execution_id, actor):
         operation, step = _lock_operation_and_step(
             step_execution_id
         )
+
+        # Дополнительная проверка принадлежности операции.
+        _require_operation_owner(actor, operation)
 
         _require_running_operation(operation)
 
@@ -374,6 +390,9 @@ def complete_step(step_execution_id, actor, result=""):
             step_execution_id
         )
 
+        # Дополнительная проверка принадлежности операции.
+        _require_operation_owner(actor, operation)
+
         _require_running_operation(operation)
 
         if step.status != StepExecutionStatus.IN_PROGRESS:
@@ -439,8 +458,6 @@ def complete_step(step_execution_id, actor, result=""):
             operation.status = OperationStatus.COMPLETED
             operation.finished_at = timezone.now()
 
-            # В модели Operation нет поля result.
-            # Результаты отдельных шагов хранятся в StepExecution.
             operation.save(
                 update_fields=[
                     "status",
@@ -493,6 +510,9 @@ def fail_step(step_execution_id, actor, error_message):
         operation, step = _lock_operation_and_step(
             step_execution_id
         )
+
+        # Дополнительная проверка принадлежности операции.
+        _require_operation_owner(actor, operation)
 
         _require_running_operation(operation)
 
@@ -591,9 +611,6 @@ def start_update_operation(ticket_id, actor):
                 .select_related(
                     "software",
                     "status",
-                    # deployment_target намеренно не включён сюда:
-                    # это nullable FK, а целевая установка отдельно
-                    # блокируется в _lock_and_validate_deployment_target().
                 )
                 .get(pk=ticket_id)
             )
@@ -853,7 +870,7 @@ def start_rollback_operation(
 
     _require_executor(actor)
 
-    # Локальные импорты помогают избежать возможных циклических импортов.
+    # Локальные импорты помогают избежать циклических импортов.
     from backups.models import Backup
     from backups.services import verify_backup
 
@@ -892,9 +909,6 @@ def start_rollback_operation(
             .select_related(
                 "software",
                 "status",
-                # deployment_target намеренно не включён сюда:
-                # это nullable FK, а целевая установка отдельно
-                # блокируется в _lock_and_validate_deployment_target().
             )
             .get(pk=parent_operation.change_ticket_id)
         )
@@ -1003,7 +1017,6 @@ def start_rollback_operation(
             )
 
         # Повторно проверяем реальное содержимое файла.
-        # verify_backup сохраняет результат проверки в базе.
         verified_backup = verify_backup(
             backup_id=backup.id,
             actor=actor,

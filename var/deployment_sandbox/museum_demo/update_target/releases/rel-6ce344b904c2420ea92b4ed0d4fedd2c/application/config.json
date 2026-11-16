@@ -1,0 +1,10 @@
+{
+  "environment": "laboratory",
+  "catalog": {
+    "allow_export": false,
+    "show_preservation_status": false
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
