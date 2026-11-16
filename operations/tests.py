@@ -2,6 +2,9 @@
 import hashlib
 import tempfile
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
@@ -697,6 +700,22 @@ class StartUpdateOperationTests(TestCase):
     """
 
     def setUp(self):
+                # В тестах этого класса проверяется создание операции,
+        # а не физическая работа адаптера и файловой системы.
+        # Реальный preflight проверяется отдельно.
+        self.preflight_patcher = patch(
+            "changes.preflight.run_preflight",
+            return_value=SimpleNamespace(
+                can_start=True,
+                messages=(),
+            ),
+        )
+
+        self.preflight_mock = self.preflight_patcher.start()
+
+        self.addCleanup(
+            self.preflight_patcher.stop
+        )
         self.temp_media = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_media.cleanup)
 
@@ -841,6 +860,35 @@ class StartUpdateOperationTests(TestCase):
         )
 
         self.assertIsNotNone(self.ticket.hash_checked_at)
+    def test_preflight_failure_does_not_create_operation(self):
+        self.preflight_mock.return_value = SimpleNamespace(
+            can_start=False,
+            messages=("Недостаточно свободного места.",),
+        )
+
+        with self.assertRaises(OperationServiceError):
+            start_update_operation(
+                ticket_id=self.ticket.pk,
+                actor=self.executor,
+            )
+
+        self.ticket.refresh_from_db()
+
+        self.assertEqual(
+            self.ticket.hash_status,
+            HashStatus.MATCH,
+        )
+
+        self.assertEqual(
+            self.ticket.status.code,
+            CardStatusCode.APPROVED,
+        )
+
+        self.assertFalse(
+            Operation.objects.filter(
+                change_ticket=self.ticket,
+            ).exists()
+        )
 
     # --------------------------------------------------------
     # ПРОВЕРКА ЦЕЛЕВОЙ УСТАНОВКИ

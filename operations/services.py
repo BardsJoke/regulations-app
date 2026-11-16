@@ -248,6 +248,115 @@ def _set_operation_error(operation, error_text):
     setattr(operation, field_name, error_text)
 
     return field_name
+def _validate_update_start_conditions(ticket, actor):
+    """
+    Проверяет обязательные условия запуска обновления.
+
+    Вызывается внутри transaction.atomic().
+    Возвращает проверенные плановые шаги.
+    """
+
+    if ticket.created_by_id != actor.pk:
+        raise PermissionDenied(
+            "Исполнитель может запускать обновление только "
+            "для собственной карточки изменения."
+        )
+
+    # Проверяем и блокируем целевую установку.
+    _lock_and_validate_deployment_target(ticket)
+
+    # Проверяем статус карточки.
+    if ticket.status.code == CardStatusCode.APPROVED:
+        pass
+
+    elif ticket.status.code == CardStatusCode.IN_PROGRESS:
+        last_update = (
+            Operation.objects
+            .filter(
+                change_ticket=ticket,
+                operation_type=OperationType.UPDATE,
+            )
+            .order_by("-attempt_number")
+            .first()
+        )
+
+        if (
+            last_update is None
+            or last_update.status != OperationStatus.FAILED
+        ):
+            raise OperationServiceError(
+                "Повторный запуск обновления допустим только "
+                "после неудачной предыдущей попытки."
+            )
+
+    else:
+        raise OperationServiceError(
+            "Обновление можно запускать только для согласованной "
+            "карточки или после неудачной предыдущей попытки."
+        )
+
+    if not ticket.approved_by_id:
+        raise OperationServiceError(
+            "У карточки отсутствует подтверждение согласования."
+        )
+
+    # Проверяем плановое окно.
+    now = timezone.now()
+
+    if ticket.window_start_at and now < ticket.window_start_at:
+        raise OperationServiceError(
+            "Плановое окно обновления ещё не началось."
+        )
+
+    if ticket.window_end_at and now > ticket.window_end_at:
+        raise OperationServiceError(
+            "Плановое окно обновления уже закончилось."
+        )
+
+    # Проверяем последовательность плановых шагов.
+    plan_steps = list(
+        PlanStep.objects
+        .filter(ticket=ticket)
+        .order_by("step_order")
+    )
+
+    if not plan_steps:
+        raise OperationServiceError(
+            "У карточки отсутствует план выполнения."
+        )
+
+    expected_order = list(
+        range(1, len(plan_steps) + 1)
+    )
+
+    actual_order = [
+        step.step_order
+        for step in plan_steps
+    ]
+
+    if actual_order != expected_order:
+        raise OperationServiceError(
+            "Порядок плановых шагов должен быть последовательным, "
+            "начиная с единицы."
+        )
+
+    if plan_steps[0].step_kind != StepKind.BACKUP:
+        raise OperationServiceError(
+            "Первым шагом плана должно быть резервное копирование."
+        )
+
+    # Проверяем наличие пакета и SHA-256.
+    if not ticket.package_file:
+        raise OperationServiceError(
+            "Для карточки не загружен пакет обновления."
+        )
+
+    if not ticket.expected_sha256:
+        raise OperationServiceError(
+            "Для пакета обновления не указана ожидаемая SHA-256."
+        )
+
+    return plan_steps
 
 
 # ============================================================
@@ -584,26 +693,28 @@ def start_update_operation(ticket_id, actor):
     """
     Запускает операцию обновления программного обеспечения.
 
-    Перед запуском проверяются:
-    - права исполнителя;
-    - принадлежность карточки пользователю;
-    - целевая установка;
-    - согласование;
-    - временное окно;
-    - совместимость;
-    - доступность ресурсов;
-    - последовательность плана;
-    - наличие пакета обновления;
-    - контрольная сумма SHA-256;
-    - отсутствие другой выполняющейся операции.
+    Этапы:
+
+    1. Проверка прав и основных условий карточки.
+    2. Проверка SHA-256 с сохранением результата.
+    3. Предварительная проверка совместимости и ресурсов.
+    4. Повторная проверка состояния карточки.
+    5. Создание операции и снимков плановых шагов.
+
+    Предварительная проверка выполняется вне транзакции,
+    чтобы не удерживать блокировки БД во время работы с файлами.
     """
 
     _require_executor(actor)
 
     hash_mismatch = False
-    operation = None
+
+    # ========================================================
+    # ЭТАП 1. ОСНОВНЫЕ ПРОВЕРКИ И SHA-256
+    # ========================================================
 
     with transaction.atomic():
+
         try:
             ticket = (
                 ChangeTicket.objects
@@ -614,122 +725,18 @@ def start_update_operation(ticket_id, actor):
                 )
                 .get(pk=ticket_id)
             )
+
         except ChangeTicket.DoesNotExist:
             raise OperationServiceError(
                 "Карточка изменения не найдена."
             )
 
-        if ticket.created_by_id != actor.id:
-            raise PermissionDenied(
-                "Исполнитель может запускать обновление только "
-                "для собственной карточки изменения."
-            )
-
-        # Проверяем и блокируем целевую установку.
-        _lock_and_validate_deployment_target(ticket)
-
-        # Проверяем статус карточки.
-        if ticket.status.code == CardStatusCode.APPROVED:
-            pass
-
-        elif ticket.status.code == CardStatusCode.IN_PROGRESS:
-            last_update = (
-                Operation.objects
-                .filter(
-                    change_ticket=ticket,
-                    operation_type=OperationType.UPDATE,
-                )
-                .order_by("-attempt_number")
-                .first()
-            )
-
-            if (
-                last_update is None
-                or last_update.status != OperationStatus.FAILED
-            ):
-                raise OperationServiceError(
-                    "Повторный запуск обновления допустим только "
-                    "после неудачной предыдущей попытки."
-                )
-
-        else:
-            raise OperationServiceError(
-                "Обновление можно запускать только для согласованной "
-                "карточки или после неудачной попытки обновления."
-            )
-
-        if not ticket.approved_by_id:
-            raise OperationServiceError(
-                "У карточки отсутствует подтверждение согласования."
-            )
-
-        # Проверяем плановое окно.
-        now = timezone.now()
-
-        if ticket.window_start_at and now < ticket.window_start_at:
-            raise OperationServiceError(
-                "Плановое окно обновления ещё не началось."
-            )
-
-        if ticket.window_end_at and now > ticket.window_end_at:
-            raise OperationServiceError(
-                "Плановое окно обновления уже закончилось."
-            )
-
-        # Проверяем совместимость.
-        if ticket.compatibility_status != CompatibilityStatus.COMPATIBLE:
-            raise OperationServiceError(
-                "Не подтверждена совместимость обновления."
-            )
-
-        # Проверяем доступность ресурсов.
-        if ticket.resources_check_status != ResourcesCheckStatus.SUFFICIENT:
-            raise OperationServiceError(
-                "Не подтверждена достаточность ресурсов."
-            )
-
-        # Получаем плановые шаги.
-        plan_steps = list(
-            PlanStep.objects
-            .filter(ticket=ticket)
-            .order_by("step_order")
+        # Проверяем владельца, согласование, стенд,
+        # временное окно и план.
+        _validate_update_start_conditions(
+            ticket,
+            actor,
         )
-
-        if not plan_steps:
-            raise OperationServiceError(
-                "У карточки отсутствует план выполнения."
-            )
-
-        expected_order = list(
-            range(1, len(plan_steps) + 1)
-        )
-
-        actual_order = [
-            step.step_order
-            for step in plan_steps
-        ]
-
-        if actual_order != expected_order:
-            raise OperationServiceError(
-                "Порядок плановых шагов должен быть последовательным, "
-                "начиная с единицы."
-            )
-
-        if plan_steps[0].step_kind != StepKind.BACKUP:
-            raise OperationServiceError(
-                "Первым шагом плана должно быть резервное копирование."
-            )
-
-        # Проверяем наличие пакета.
-        if not ticket.package_file:
-            raise OperationServiceError(
-                "Для карточки не загружен пакет обновления."
-            )
-
-        if not ticket.expected_sha256:
-            raise OperationServiceError(
-                "Для пакета обновления не указана ожидаемая SHA-256."
-            )
 
         # Вычисляем фактическую контрольную сумму.
         actual_sha256 = _calculate_package_sha256(
@@ -742,11 +749,13 @@ def start_update_operation(ticket_id, actor):
         )
 
         ticket.actual_sha256 = actual_sha256
+
         ticket.hash_status = (
             HashStatus.MISMATCH
             if hash_mismatch
             else HashStatus.MATCH
         )
+
         ticket.hash_checked_at = timezone.now()
 
         ticket.save(
@@ -758,85 +767,169 @@ def start_update_operation(ticket_id, actor):
             ]
         )
 
-        if not hash_mismatch:
-            # Проверяем, что другая операция не выполняется.
-            if Operation.objects.filter(
-                change_ticket=ticket,
-                status=OperationStatus.RUNNING,
-            ).exists():
-                raise OperationServiceError(
-                    "Для этой карточки уже выполняется другая операция."
-                )
+    # ========================================================
+    # ЭТАП 2. СОХРАНЁННЫЙ РЕЗУЛЬТАТ ПРОВЕРКИ SHA-256
+    # ========================================================
 
-            max_sequence = (
-                Operation.objects
-                .filter(change_ticket=ticket)
-                .aggregate(value=Max("sequence_number"))["value"]
-                or 0
-            )
-
-            max_attempt = (
-                Operation.objects
-                .filter(
-                    change_ticket=ticket,
-                    operation_type=OperationType.UPDATE,
-                )
-                .aggregate(value=Max("attempt_number"))["value"]
-                or 0
-            )
-
-            # Создаём операцию обновления.
-            operation = Operation.objects.create(
-                change_ticket=ticket,
-                operation_type=OperationType.UPDATE,
-                sequence_number=max_sequence + 1,
-                attempt_number=max_attempt + 1,
-                initiated_by=actor,
-                status=OperationStatus.RUNNING,
-            )
-
-            # Создаём снимки плановых шагов.
-            for index, plan_step in enumerate(plan_steps, start=1):
-                StepExecution.objects.create(
-                    operation=operation,
-                    plan_step=plan_step,
-                    step_order=plan_step.step_order,
-                    step_kind=plan_step.step_kind,
-                    name=plan_step.name,
-                    description=plan_step.description,
-                    planned_duration_min=plan_step.planned_duration_min,
-                    status=(
-                        StepExecutionStatus.AVAILABLE
-                        if index == 1
-                        else StepExecutionStatus.LOCKED
-                    ),
-                )
-
-            # Переводим согласованную карточку в работу.
-            if ticket.status.code == CardStatusCode.APPROVED:
-                _set_ticket_status(
-                    ticket,
-                    CardStatusCode.IN_PROGRESS,
-                )
-
-            _record_operation_event(
-                actor=actor,
-                action=AuditAction.UPDATE_STARTED,
-                operation=operation,
-                details={
-                    "ticket_id": str(ticket.id),
-                    "software_id": str(ticket.software_id),
-                    "deployment_target_id": str(ticket.deployment_target_id),
-                    "attempt_number": operation.attempt_number,
-                },
-            )
-
-    # Ошибку поднимаем за пределами транзакции,
-    # чтобы результат проверки SHA-256 сохранился в карточке.
+    # Ошибка поднимается после завершения транзакции,
+    # чтобы hash_status=MISMATCH сохранился в базе.
     if hash_mismatch:
         raise OperationServiceError(
             "Контрольная сумма пакета обновления не совпадает "
             "с ожидаемой SHA-256. Запуск операции отменён."
+        )
+
+    # ========================================================
+    # ЭТАП 3. ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА
+    # ========================================================
+
+    from changes.preflight import run_preflight
+
+    preflight_report = run_preflight(
+        ticket_id=ticket_id,
+        actor=actor,
+    )
+
+    if not preflight_report.can_start:
+        details = "; ".join(
+            preflight_report.messages
+        )
+
+        raise OperationServiceError(
+            "Предварительные проверки не пройдены. "
+            "Создание операции отменено. "
+            + details
+        )
+
+    # ========================================================
+    # ЭТАП 4. ПОВТОРНАЯ ПРОВЕРКА И СОЗДАНИЕ ОПЕРАЦИИ
+    # ========================================================
+
+    with transaction.atomic():
+
+        try:
+            ticket = (
+                ChangeTicket.objects
+                .select_for_update()
+                .select_related(
+                    "software",
+                    "status",
+                )
+                .get(pk=ticket_id)
+            )
+
+        except ChangeTicket.DoesNotExist:
+            raise OperationServiceError(
+                "Карточка изменения не найдена."
+            )
+
+        # Повторно проверяем критичные условия.
+        # Это защищает от изменения карточки во время preflight.
+        plan_steps = _validate_update_start_conditions(
+            ticket,
+            actor,
+        )
+
+        # Проверяем результаты предварительной проверки.
+        if (
+            ticket.compatibility_status
+            != CompatibilityStatus.COMPATIBLE
+        ):
+            raise OperationServiceError(
+                "Не подтверждена совместимость обновления."
+            )
+
+        if (
+            ticket.resources_check_status
+            != ResourcesCheckStatus.SUFFICIENT
+        ):
+            raise OperationServiceError(
+                "Не подтверждена достаточность ресурсов."
+            )
+
+        # Убеждаемся, что SHA-256 осталась подтверждённой.
+        if (
+            ticket.hash_status != HashStatus.MATCH
+            or not ticket.actual_sha256
+            or ticket.actual_sha256.lower()
+            != ticket.expected_sha256.lower()
+        ):
+            raise OperationServiceError(
+                "Контрольная сумма пакета не подтверждена. "
+                "Повторите предварительную проверку."
+            )
+
+        # Проверяем отсутствие другой выполняющейся операции.
+        if Operation.objects.filter(
+            change_ticket=ticket,
+            status=OperationStatus.RUNNING,
+        ).exists():
+            raise OperationServiceError(
+                "Для этой карточки уже выполняется другая операция."
+            )
+
+        max_sequence = (
+            Operation.objects
+            .filter(change_ticket=ticket)
+            .aggregate(value=Max("sequence_number"))["value"]
+            or 0
+        )
+
+        max_attempt = (
+            Operation.objects
+            .filter(
+                change_ticket=ticket,
+                operation_type=OperationType.UPDATE,
+            )
+            .aggregate(value=Max("attempt_number"))["value"]
+            or 0
+        )
+
+        # Создаём операцию обновления.
+        operation = Operation.objects.create(
+            change_ticket=ticket,
+            operation_type=OperationType.UPDATE,
+            sequence_number=max_sequence + 1,
+            attempt_number=max_attempt + 1,
+            initiated_by=actor,
+            status=OperationStatus.RUNNING,
+        )
+
+        # Создаём неизменяемые снимки плановых шагов.
+        for index, plan_step in enumerate(plan_steps, start=1):
+
+            StepExecution.objects.create(
+                operation=operation,
+                plan_step=plan_step,
+                step_order=plan_step.step_order,
+                step_kind=plan_step.step_kind,
+                name=plan_step.name,
+                description=plan_step.description,
+                planned_duration_min=plan_step.planned_duration_min,
+                status=(
+                    StepExecutionStatus.AVAILABLE
+                    if index == 1
+                    else StepExecutionStatus.LOCKED
+                ),
+            )
+
+        # Переводим согласованную карточку в работу.
+        if ticket.status.code == CardStatusCode.APPROVED:
+            _set_ticket_status(
+                ticket,
+                CardStatusCode.IN_PROGRESS,
+            )
+
+        _record_operation_event(
+            actor=actor,
+            action=AuditAction.UPDATE_STARTED,
+            operation=operation,
+            details={
+                "ticket_id": str(ticket.id),
+                "software_id": str(ticket.software_id),
+                "deployment_target_id": str(ticket.deployment_target_id),
+                "attempt_number": operation.attempt_number,
+            },
         )
 
     return operation
